@@ -4,6 +4,7 @@ import {
   AlertOctagon,
   BarChart3,
   Blocks,
+  Bot,
   CandlestickChart,
   Hash,
   Moon,
@@ -13,6 +14,7 @@ import {
 } from 'lucide-react';
 import { dqiApi } from './services/dqiApi';
 import type { ActiveSymbol, DqiTab, LiveTickEvent, PaperAccount } from './types/dqi';
+import { AnalyserBotWorkspace } from './components/AnalyserBotWorkspace';
 import { TerminalWorkspace } from './components/TerminalWorkspace';
 import { DigitsStudio } from './components/DigitsStudio';
 import { QuantScannerWorkspace } from './components/QuantScannerWorkspace';
@@ -25,15 +27,16 @@ const TABS: Array<{
   shortDesc: string;
   icon: React.FC<{ className?: string }>;
 }> = [
+  { id: 'analyser', label: 'AI Analyser', shortDesc: 'Beginner signal & AI brief', icon: Bot },
   { id: 'terminal', label: 'Terminal', shortDesc: 'Live chart & paper trade', icon: CandlestickChart },
-  { id: 'digits', label: 'Digits Studio', shortDesc: 'Last-digit frequency & Match/Differ', icon: Hash },
+  { id: 'digits', label: 'Digits Studio', shortDesc: 'Last-digit & Match/Differ', icon: Hash },
   { id: 'scanner', label: 'Quant Scanner', shortDesc: 'Indicators, scan & backtest', icon: Radar },
   { id: 'strategy', label: 'Strategy & Paper', shortDesc: 'Bot blocks, XML & scheduler', icon: Blocks },
   { id: 'risk', label: 'Risk & Accounts', shortDesc: 'Recovery caps, OAuth & DB', icon: ShieldCheck },
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<DqiTab>('terminal');
+  const [activeTab, setActiveTab] = useState<DqiTab>('analyser');
   const [darkMode, setDarkMode] = useState(false);
 
   const [symbols, setSymbols] = useState<ActiveSymbol[]>([]);
@@ -65,7 +68,7 @@ export default function App() {
   // Check query string after OAuth redirect
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const oauthState = params.get('deriv_oauth');
+    const oauthState = params.get('deriv_oauth') || params.get('deriv');
     const oauthErr = params.get('oauth_error');
     if (oauthState === 'connected') {
       setGlobalNotice('Deriv account connected via OAuth 2.0 PKCE.');
@@ -366,6 +369,19 @@ export default function App() {
 
           {/* Active Workspace Canvas */}
           <main className="flex-1 p-4">
+            {activeTab === 'analyser' && (
+              <AnalyserBotWorkspace
+                symbols={symbols}
+                selectedSymbol={selectedSymbol}
+                onSelectSymbol={setSelectedSymbol}
+                latestTick={latestTick}
+                liveTapeBuffer={liveTapeBuffer}
+                paperAccount={paperAccount}
+                onJumpToTab={setActiveTab}
+                onRefreshSystem={() => void refreshSystemState()}
+              />
+            )}
+
             {activeTab === 'terminal' && (
               <TerminalWorkspace
                 symbols={symbols}

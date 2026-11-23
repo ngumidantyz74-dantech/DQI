@@ -1,6 +1,7 @@
 import { browserDerivPublic } from './derivBrowserFallback';
 import type {
   ActiveSymbol,
+  AiAnalyzeBrief,
   BoundedRecoveryPolicy,
   CandleBar,
   ContractSupport,
@@ -414,6 +415,26 @@ export const dqiApi = {
   logoutQuantAdmin: () => apiFetch<{ authenticated: boolean }>('/api/v1/quant/auth/logout', {}),
 
   runMigrations: () => apiFetch<{ ok: boolean; applied: string[]; skipped: string[] }>('/api/v1/system/migrate', {}),
+
+  generateAiBrief: (payload: {
+    symbol: string;
+    spotQuote: string | null;
+    latestDigit: number | null;
+    tickWindowCount: number;
+    volatilityRegime: string;
+    evenPct: number;
+    oddPct: number;
+    over4Pct: number;
+    under5Pct: number;
+    hottestDigit: { digit: number; pct: number } | null;
+    coldestDigit: { digit: number; pct: number } | null;
+    matchBreakEvenPct: number | null;
+    differBreakEvenPct: number | null;
+    quantDirection: string | null;
+    quantConfidencePct: number | null;
+    quantRegime: string | null;
+    rsi14: number | null;
+  }) => apiFetch<AiAnalyzeBrief>('/api/v1/ai/analyze-brief', payload),
 
   subscribeLiveStream: (
     symbol: string,

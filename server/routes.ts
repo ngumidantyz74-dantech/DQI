@@ -42,6 +42,7 @@ import {
   verifyMutationOrigin,
   verifyPassword,
 } from './security.ts';
+import { generateAiMarketBrief } from './aiAnalyzer.ts';
 
 const SYMBOL_REGEX = /^[A-Za-z0-9_]{2,30}$/;
 
@@ -1308,5 +1309,44 @@ export function registerApiRoutes(app: Express): void {
       liveGate: previewStore.liveGate,
       automationControl: previewStore.automationControl,
     });
+  });
+
+  // ---------------- AI ANALYSER BOT BRIEF (GEMINI 4 HYDROGEN) ----------------
+
+  app.post('/api/v1/ai/analyze-brief', async (req: Request, res: Response) => {
+    const parsed = z
+      .object({
+        symbol: z.string().regex(SYMBOL_REGEX),
+        spotQuote: z.string().nullable().default(null),
+        latestDigit: z.number().int().min(0).max(9).nullable().default(null),
+        tickWindowCount: z.number().int().min(0).max(5000).default(0),
+        volatilityRegime: z.string().default('INSUFFICIENT_DATA'),
+        evenPct: z.number().min(0).max(100).default(50),
+        oddPct: z.number().min(0).max(100).default(50),
+        over4Pct: z.number().min(0).max(100).default(50),
+        under5Pct: z.number().min(0).max(100).default(50),
+        hottestDigit: z.object({ digit: z.number().int().min(0).max(9), pct: z.number() }).nullable().default(null),
+        coldestDigit: z.object({ digit: z.number().int().min(0).max(9), pct: z.number() }).nullable().default(null),
+        matchBreakEvenPct: z.number().nullable().default(null),
+        differBreakEvenPct: z.number().nullable().default(null),
+        quantDirection: z.string().nullable().default(null),
+        quantConfidencePct: z.number().nullable().default(null),
+        quantRegime: z.string().nullable().default(null),
+        rsi14: z.number().nullable().default(null),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'INVALID_AI_BRIEF_PAYLOAD' });
+      return;
+    }
+
+    try {
+      const brief = await generateAiMarketBrief(parsed.data);
+      res.json(brief);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'AI analysis failed';
+      const status = msg.includes('GEMINI_API_KEY') ? 503 : 502;
+      res.status(status).json({ error: msg });
+    }
   });
 }

@@ -1,4 +1,15 @@
-export type DqiTab = 'terminal' | 'digits' | 'scanner' | 'strategy' | 'risk';
+export type DqiTab = 'analyser' | 'terminal' | 'digits' | 'scanner' | 'strategy' | 'risk';
+
+export interface AiAnalyzeBrief {
+  headline: string;
+  verdict: 'RISE_BIAS' | 'FALL_BIAS' | 'EVEN_ODD_WATCH' | 'DIFFER_WATCH' | 'WAIT_BALANCED';
+  plainSummary: string;
+  bestSetup: string;
+  whyBullets: string[];
+  beginnerTip: string;
+  generatedAt: string;
+  model: string;
+}
 
 export interface ActiveSymbol {
   symbol: string;
