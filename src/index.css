@@ -3,12 +3,21 @@
 
 @layer base {
   :root {
-    --deriv-red: #FF444F;
-    --deriv-red-hover: #EB3E48;
-    --deriv-teal: #4BB4B3;
-    --deriv-green: #00A79E;
-    --deriv-amber: #FFAD3A;
-    --deriv-loss: #EC3F3F;
+    --dqi-bg: #FFFFFF;
+    --dqi-surface: #F5F7FA;
+    --dqi-block-bg: #F1F2F4;
+    --dqi-sidebar: #101820;
+    --dqi-blue: #0866FF;
+    --dqi-royal-blue: #203DA8;
+    --dqi-cyan: #08B9E6;
+    --dqi-turquoise: #20B7C6;
+    --dqi-buy: #00A88F;
+    --dqi-sell: #FF4D5A;
+    --dqi-red: #FF444F;
+    --dqi-amber: #FFAD3A;
+    --dqi-text: #20242B;
+    --dqi-muted: #6B7280;
+    --dqi-border: #E5E9EF;
   }
 
   body {
@@ -24,7 +33,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Custom sleek scrollbars for trading tables */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -35,10 +43,10 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(153, 153, 153, 0.25);
+  background: rgba(107, 114, 128, 0.25);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(153, 153, 153, 0.45);
+  background: rgba(107, 114, 128, 0.45);
 }
