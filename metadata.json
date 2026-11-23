@@ -1,0 +1,6 @@
+{
+  "name": "DerivBot Quant Terminal",
+  "description": "Automated Deriv DBot strategy runner, XML parser, live WebSocket tick engine, and transaction CSV analytics terminal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
