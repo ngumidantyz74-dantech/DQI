@@ -1,29 +1,22 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowDownRight,
-  ArrowUpRight,
-  BarChart3,
-  Bot,
+  AlertTriangle,
   CheckCircle2,
-  Compass,
-  Hash,
+  Lock,
+  Pause,
   Play,
   Radar,
-  RefreshCw,
+  RotateCcw,
   ShieldCheck,
-  Sparkles,
   Wallet,
 } from 'lucide-react';
 import { dqiApi } from '../services/dqiApi';
 import type {
   ActiveSymbol,
-  AiAnalyzeBrief,
   DerivSessionState,
   DigitsFullResponse,
-  DqiTab,
   LiveDerivContract,
   LiveTickEvent,
-  QuantAnalysis,
 } from '../types/dqi';
 
 interface AnalyserBotWorkspaceProps {
@@ -35,31 +28,146 @@ interface AnalyserBotWorkspaceProps {
   derivSession: DerivSessionState;
   liveContracts: LiveDerivContract[];
   onOpenConnect: () => void;
-  onJumpToTab: (tab: DqiTab) => void;
 }
 
-const BEGINNER_MARKETS = [
+type StrategyFilter = 'BEST' | 'DIGITMATCH' | 'DIGITDIFF';
+type BotMode = 'MANUAL' | 'ASK' | 'AUTO';
+
+interface RankedSignal {
+  symbol: string;
+  symbolLabel: string;
+  contractType: 'DIGITMATCH' | 'DIGITDIFF';
+  digit: number;
+  score: number;
+  strength: 'STRONG' | 'MODERATE' | 'WAIT';
+  observedPct: number;
+  avoidPct: number;
+  lastSeenTicksAgo: number | null;
+  payout: number | null;
+  askPrice: number | null;
+  reason: string;
+}
+
+interface BotTradeRecord {
+  contractId: number;
+  symbol: string;
+  contractType: 'DIGITMATCH' | 'DIGITDIFF';
+  digit: number;
+  stake: number;
+  status: 'open' | 'won' | 'lost' | 'sold';
+  profit: number;
+  entrySpot: string | null;
+  exitSpot: string | null;
+  isVirtual: boolean;
+  timestamp: string;
+}
+
+const CORE_MARKETS: Array<{ code: string; label: string }> = [
+  { code: '1HZ10V', label: 'Volatility 10 (1s)' },
+  { code: '1HZ15V', label: 'Volatility 15 (1s)' },
+  { code: '1HZ25V', label: 'Volatility 25 (1s)' },
+  { code: '1HZ50V', label: 'Volatility 50 (1s)' },
+  { code: '1HZ75V', label: 'Volatility 75 (1s)' },
   { code: '1HZ100V', label: 'Volatility 100 (1s)' },
-  { code: 'R_100', label: 'Volatility 100' },
-  { code: 'R_75', label: 'Volatility 75' },
   { code: 'R_10', label: 'Volatility 10' },
+  { code: 'R_25', label: 'Volatility 25' },
+  { code: 'R_50', label: 'Volatility 50' },
+  { code: 'R_75', label: 'Volatility 75' },
+  { code: 'R_100', label: 'Volatility 100' },
 ];
 
-const STAKE_PRESETS = [0.5, 1, 2, 5];
+const SCAN_PHASES = [
+  'Streaming live Deriv ticks',
+  'Measuring digit frequencies & entropy',
+  'Checking tick cadence & volatility',
+  'Scanning digit gaps & transition pairs',
+  'Scoring best Match / Differ setup',
+];
 
-function friendlyVolatility(regime: string | undefined): { label: string; hint: string } {
-  switch (regime) {
-    case 'VERY_LOW':
-    case 'LOW':
-      return { label: 'Calm Market', hint: 'Small steady price steps' };
-    case 'NORMAL':
-      return { label: 'Normal Speed', hint: 'Balanced tick movement' };
-    case 'HIGH':
-    case 'EXTREME':
-      return { label: 'Fast / Volatile', hint: 'Larger price jumps — use small stakes' };
-    default:
-      return { label: 'Live Tick Flow', hint: 'Tracking incoming ticks' };
+const MIN_STAKE_PRESETS = [0.35, 0.5, 1.0];
+const BOT_SETTINGS_KEY = 'dqi_match_differ_bot_v2';
+
+function marketNameFor(code: string, symbols: ActiveSymbol[]): string {
+  return (
+    symbols.find((s) => s.symbol === code)?.display_name ||
+    CORE_MARKETS.find((m) => m.code === code)?.label ||
+    code
+  );
+}
+
+function scoreCandidatesFromDigits(
+  symbol: string,
+  symbolLabel: string,
+  res: DigitsFullResponse,
+  filter: StrategyFilter
+): RankedSignal[] {
+  const { analytics, volatility, proposals } = res;
+  const latestDigit = analytics.latestObservedDigit;
+  const volPenalty =
+    volatility.regime === 'EXTREME' ? 12 : volatility.regime === 'HIGH' ? 4 : 0;
+
+  const transitionMap = new Map<number, number>();
+  for (const pair of analytics.transitionHotPairs) {
+    if (latestDigit !== null && pair.from === latestDigit) {
+      transitionMap.set(pair.to, pair.ratePct);
+    }
   }
+
+  const out: RankedSignal[] = [];
+
+  for (const row of analytics.digits) {
+    const gap = row.lastSeenTicksAgo ?? 10;
+    const transPct = transitionMap.get(row.digit) ?? 10;
+
+    if (filter === 'BEST' || filter === 'DIGITDIFF') {
+      const underAvg = Math.max(-6, 10 - row.percentage);
+      const transPenalty = Math.max(0, transPct - 12) * 1.1;
+      const recentAbsenceBonus = gap >= 8 ? Math.min(8, (gap - 7) * 0.8) : gap <= 1 ? -4 : 0;
+      const rawScore = 62 + underAvg * 4.2 + recentAbsenceBonus - transPenalty - volPenalty;
+      const score = Math.max(15, Math.min(99, Math.round(rawScore)));
+      const strength = score >= 80 ? 'STRONG' : score >= 65 ? 'MODERATE' : 'WAIT';
+      out.push({
+        symbol,
+        symbolLabel,
+        contractType: 'DIGITDIFF',
+        digit: row.digit,
+        score,
+        strength,
+        observedPct: row.percentage,
+        avoidPct: Number((100 - row.percentage).toFixed(1)),
+        lastSeenTicksAgo: row.lastSeenTicksAgo,
+        payout: proposals.differ?.payout ?? null,
+        askPrice: proposals.differ?.askPrice ?? null,
+        reason: `Digit ${row.digit} appeared ${row.percentage.toFixed(1)}% (${(100 - row.percentage).toFixed(1)}% differ rate) · last seen ${gap} ticks ago`,
+      });
+    }
+
+    if (filter === 'BEST' || filter === 'DIGITMATCH') {
+      const overAvg = Math.max(-5, row.percentage - 10);
+      const transBonus = Math.max(0, transPct - 10) * 1.4;
+      const gapCycleBonus = gap >= 6 && gap <= 16 ? 7 : 0;
+      const rawScore = 54 + overAvg * 4.5 + transBonus + gapCycleBonus - volPenalty;
+      const score = Math.max(15, Math.min(99, Math.round(rawScore)));
+      const strength = score >= 80 ? 'STRONG' : score >= 65 ? 'MODERATE' : 'WAIT';
+      out.push({
+        symbol,
+        symbolLabel,
+        contractType: 'DIGITMATCH',
+        digit: row.digit,
+        score,
+        strength,
+        observedPct: row.percentage,
+        avoidPct: Number((100 - row.percentage).toFixed(1)),
+        lastSeenTicksAgo: row.lastSeenTicksAgo,
+        payout: proposals.match?.payout ?? null,
+        askPrice: proposals.match?.askPrice ?? null,
+        reason: `Digit ${row.digit} hit ${row.percentage.toFixed(1)}% in sample · ${transPct > 12 ? `Markov lift ${transPct.toFixed(0)}% after ${latestDigit}` : `last seen ${gap} ticks ago`}`,
+      });
+    }
+  }
+
+  out.sort((a, b) => b.score - a.score);
+  return out;
 }
 
 export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
@@ -71,98 +179,165 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   derivSession,
   liveContracts,
   onOpenConnect,
-  onJumpToTab,
 }) => {
-  const [tickWindow, setTickWindow] = useState(100);
-  const [chartTimeframe, setChartTimeframe] = useState('M5');
-  const [loadingData, setLoadingData] = useState(false);
+  // Persisted user preferences (selected markets to scan, strategy, stake rules)
+  const savedCfg = useMemo(() => {
+    try {
+      const raw = window.localStorage.getItem(BOT_SETTINGS_KEY);
+      return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }, []);
+
+  const [scanMarkets, setScanMarkets] = useState<string[]>(() => {
+    if (Array.isArray(savedCfg.scanMarkets) && savedCfg.scanMarkets.length > 0) {
+      return savedCfg.scanMarkets.map(String);
+    }
+    return [selectedSymbol || '1HZ15V'];
+  });
+
+  const [strategyFilter, setStrategyFilter] = useState<StrategyFilter>(() =>
+    savedCfg.strategyFilter === 'DIGITMATCH' || savedCfg.strategyFilter === 'DIGITDIFF'
+      ? savedCfg.strategyFilter
+      : 'BEST'
+  );
+  const [botMode, setBotMode] = useState<BotMode>('MANUAL');
+
+  // Best Match/Differ stake & $10 drawdown protection settings
+  const [minStake, setMinStake] = useState<number>(() =>
+    typeof savedCfg.minStake === 'number' && savedCfg.minStake >= 0.35 ? savedCfg.minStake : 0.35
+  );
+  const [winStepAdd, setWinStepAdd] = useState<number>(() =>
+    typeof savedCfg.winStepAdd === 'number' && savedCfg.winStepAdd >= 0 ? savedCfg.winStepAdd : 0.35
+  );
+  const [maxStakeCap, setMaxStakeCap] = useState<number>(() =>
+    typeof savedCfg.maxStakeCap === 'number' && savedCfg.maxStakeCap >= 0.35 ? savedCfg.maxStakeCap : 2.0
+  );
+  const [maxDrawdown] = useState<number>(10.0); // Hard $10 max drawdown protection
+  const [minScoreThreshold, setMinScoreThreshold] = useState<number>(() =>
+    typeof savedCfg.minScoreThreshold === 'number' ? savedCfg.minScoreThreshold : 74
+  );
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        BOT_SETTINGS_KEY,
+        JSON.stringify({
+          scanMarkets,
+          strategyFilter,
+          minStake,
+          winStepAdd,
+          maxStakeCap,
+          minScoreThreshold,
+        })
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [scanMarkets, strategyFilter, minStake, winStepAdd, maxStakeCap, minScoreThreshold]);
+
+  // Live digit feed state for the currently focused symbol
+  const [digitsData, setDigitsData] = useState<DigitsFullResponse | null>(null);
   const [dataError, setDataError] = useState<string | null>(null);
 
-  const [digitsData, setDigitsData] = useState<DigitsFullResponse | null>(null);
-  const [quantData, setQuantData] = useState<QuantAnalysis | null>(null);
+  // 5-phase scanner state
+  const [scanning, setScanning] = useState(false);
+  const [scanPhaseIdx, setScanPhaseIdx] = useState(0);
+  const [rankedSignals, setRankedSignals] = useState<RankedSignal[]>([]);
+  const [lockedSignal, setLockedSignal] = useState<RankedSignal | null>(null);
+  const [askPromptSignal, setAskPromptSignal] = useState<RankedSignal | null>(null);
+  const [autoRunning, setAutoRunning] = useState(false);
+  const [realAccountOptIn, setRealAccountOptIn] = useState(false);
 
-  // Server-side Gemini AI brief
-  const [aiBrief, setAiBrief] = useState<AiAnalyzeBrief | null>(null);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiError, setAiError] = useState<string | null>(null);
-
-  // Real Deriv Trade Box (Demo VRTC or Real CR)
-  const [tradeType, setTradeType] = useState<'CALL' | 'PUT' | 'DIGITEVEN' | 'DIGITODD' | 'DIGITDIFF'>('CALL');
-  const [tradeDigit, setTradeDigit] = useState<number>(0);
-  const [tradeStake, setTradeStake] = useState<number>(1);
-  const [tradeDuration, setTradeDuration] = useState<number>(5);
-  const [tradeUnit, setTradeUnit] = useState<'t' | 's'>('t');
-  const [liveProposal, setLiveProposal] = useState<{
-    askPrice: number;
-    payout: number;
-    breakEvenProbPct: number | null;
-  } | null>(null);
+  // Bot session progress & 2-win streak / min-loss tracker
+  const [sessionAccountId, setSessionAccountId] = useState<string | null>(null);
+  const [sessionStartBalance, setSessionStartBalance] = useState<number | null>(null);
+  const [sessionPeakBalance, setSessionPeakBalance] = useState<number | null>(null);
+  const [consecutiveWins, setConsecutiveWins] = useState(0);
+  const [currentStake, setCurrentStake] = useState<number>(minStake);
+  const [sessionTrades, setSessionTrades] = useState<BotTradeRecord[]>([]);
   const [tradeBusy, setTradeBusy] = useState(false);
-  const [tradeMsg, setTradeMsg] = useState<string | null>(null);
-  const [realTradeConfirm, setRealTradeConfirm] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const processedContractsRef = useRef<Set<number>>(new Set());
 
-  const loadAnalysis = useCallback(async () => {
-    setLoadingData(true);
-    setDataError(null);
-    let firstErr: string | null = null;
-    try {
-      const [digRes, qRes] = await Promise.all([
-        dqiApi.analyzeDigits(selectedSymbol, tickWindow, tradeStake, 1).catch((err) => {
-          firstErr = firstErr || (err instanceof Error ? err.message : String(err));
-          return null;
-        }),
-        dqiApi.analyzeQuant(selectedSymbol, chartTimeframe, 160).catch((err) => {
-          firstErr = firstErr || (err instanceof Error ? err.message : String(err));
-          return null;
-        }),
-      ]);
-      if (!digRes && !qRes) {
-        throw new Error(firstErr || 'Unable to reach Deriv servers. Tap Refresh or set your App ID in Connect Deriv.');
-      }
-      if (digRes) setDigitsData(digRes);
-      if (qRes) setQuantData(qRes);
-    } catch (err) {
-      setDataError(err instanceof Error ? err.message : 'Unable to analyze market');
-    } finally {
-      setLoadingData(false);
+  // Sync session start/peak balance when Deriv account connects or switches
+  useEffect(() => {
+    if (!derivSession.connected || derivSession.activeBalance === null) return;
+    if (sessionAccountId !== derivSession.activeLoginId) {
+      setSessionAccountId(derivSession.activeLoginId);
+      setSessionStartBalance(derivSession.activeBalance);
+      setSessionPeakBalance(derivSession.activeBalance);
+      setConsecutiveWins(0);
+      setCurrentStake(minStake);
+      setRealAccountOptIn(false);
+      setAutoRunning(false);
+      setAskPromptSignal(null);
+      return;
     }
-  }, [selectedSymbol, tickWindow, chartTimeframe, tradeStake]);
+    setSessionPeakBalance((prev) =>
+      prev === null ? derivSession.activeBalance : Math.max(prev, derivSession.activeBalance!)
+    );
+  }, [derivSession.connected, derivSession.activeLoginId, derivSession.activeBalance, sessionAccountId, minStake]);
 
+  // Keep currentStake aligned with minStake when streak is < 2
   useEffect(() => {
-    if (latestTick && dataError) {
-      setDataError(null);
+    if (consecutiveWins < 2) {
+      setCurrentStake(minStake);
     }
-  }, [latestTick, dataError]);
+  }, [minStake, consecutiveWins]);
+
+  // Compute live session metrics & $10 drawdown guard
+  const settledTrades = useMemo(
+    () => sessionTrades.filter((t) => t.status === 'won' || t.status === 'lost' || t.status === 'sold'),
+    [sessionTrades]
+  );
+  const winsCount = useMemo(() => settledTrades.filter((t) => t.profit > 0).length, [settledTrades]);
+  const lossesCount = useMemo(() => settledTrades.filter((t) => t.profit <= 0).length, [settledTrades]);
+  const sessionRealizedPnl = useMemo(
+    () => Number(settledTrades.reduce((sum, t) => sum + t.profit, 0).toFixed(2)),
+    [settledTrades]
+  );
+
+  const balanceDrawdown =
+    derivSession.connected &&
+    derivSession.activeBalance !== null &&
+    sessionPeakBalance !== null
+      ? Math.max(0, Number((sessionPeakBalance - derivSession.activeBalance).toFixed(2)))
+      : 0;
+  const pnlDrawdown = Math.max(0, Number((-sessionRealizedPnl).toFixed(2)));
+  const drawdownUsed = Math.max(balanceDrawdown, pnlDrawdown);
+  const drawdownRemaining = Math.max(0, Number((maxDrawdown - drawdownUsed).toFixed(2)));
+  const drawdownLocked = drawdownUsed >= maxDrawdown || drawdownRemaining < 0.35;
+
+  // Clamp effective next stake so a loss NEVER exceeds $10 drawdown cap
+  const effectiveNextStake = useMemo(() => {
+    if (drawdownLocked) return 0;
+    const capped = Math.min(currentStake, maxStakeCap, drawdownRemaining);
+    return Math.max(0.35, Number(capped.toFixed(2)));
+  }, [currentStake, maxStakeCap, drawdownRemaining, drawdownLocked]);
+
+  // Live proposal for the currently locked signal
+  const [liveProposal, setLiveProposal] = useState<{ askPrice: number; payout: number } | null>(null);
+
+  const activeContractType: 'DIGITMATCH' | 'DIGITDIFF' =
+    lockedSignal?.contractType ?? (strategyFilter === 'DIGITMATCH' ? 'DIGITMATCH' : 'DIGITDIFF');
+  const activeDigit = lockedSignal?.digit ?? 0;
 
   useEffect(() => {
-    setAiBrief(null);
-    setAiError(null);
-    void loadAnalysis();
-  }, [loadAnalysis]);
-
-  // Live proposal calculation whenever contract type, digit, stake, or duration changes
-  useEffect(() => {
+    if (drawdownLocked) return;
     let cancelled = false;
-    const isDigit = tradeType === 'DIGITEVEN' || tradeType === 'DIGITODD' || tradeType === 'DIGITDIFF';
-    const dur = isDigit ? Math.min(10, Math.max(1, tradeDuration)) : tradeDuration;
-    const unit = isDigit ? 't' : tradeUnit;
     void dqiApi
       .getProposal({
-        symbol: selectedSymbol,
-        contractType: tradeType,
-        amount: tradeStake,
-        duration: dur,
-        durationUnit: unit,
-        barrier: tradeType === 'DIGITDIFF' ? String(tradeDigit) : undefined,
+        symbol: lockedSignal?.symbol || selectedSymbol,
+        contractType: activeContractType,
+        amount: effectiveNextStake || minStake,
+        duration: 1,
+        durationUnit: 't',
+        barrier: String(activeDigit),
       })
       .then((p) => {
-        if (!cancelled) {
-          setLiveProposal({
-            askPrice: p.askPrice,
-            payout: p.payout,
-            breakEvenProbPct: p.breakEvenProbPct,
-          });
-        }
+        if (!cancelled) setLiveProposal({ askPrice: p.askPrice, payout: p.payout });
       })
       .catch(() => {
         if (!cancelled) setLiveProposal(null);
@@ -170,294 +345,480 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [selectedSymbol, tradeType, tradeDigit, tradeStake, tradeDuration, tradeUnit]);
+  }, [lockedSignal?.symbol, selectedSymbol, activeContractType, activeDigit, effectiveNextStake, minStake, drawdownLocked]);
 
-  const displayQuote = latestTick?.rawQuote ?? digitsData?.analytics.latestQuote ?? null;
-  const displayDigit = latestTick?.lastDigit ?? digitsData?.analytics.latestObservedDigit ?? null;
+  // Real-time 0–9 digit calculation on the currently viewed symbol
+  useEffect(() => {
+    let cancelled = false;
+    void dqiApi
+      .analyzeDigits(selectedSymbol, 100, minStake, 1)
+      .then((res) => {
+        if (!cancelled) {
+          setDigitsData(res);
+          setDataError(null);
+          if (!lockedSignal || lockedSignal.symbol !== selectedSymbol) {
+            const ranked = scoreCandidatesFromDigits(
+              selectedSymbol,
+              marketNameFor(selectedSymbol, symbols),
+              res,
+              strategyFilter
+            );
+            if (ranked.length > 0) {
+              setRankedSignals(ranked);
+              setLockedSignal(ranked[0]);
+            }
+          }
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setDataError(err instanceof Error ? err.message : 'Waiting for Deriv live quotes...');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSymbol, minStake, strategyFilter, symbols]);
 
-  // REAL-TIME tick-by-tick digit frequency calculation (combines initial history + live streaming ticks)
-  const liveDigitsComputation = useMemo(() => {
-    const baseTape = (digitsData?.analytics.tape ?? []).map((t) => ({
+  const liveDigits = useMemo(() => {
+    const base = (digitsData?.analytics.tape ?? []).map((t) => ({
       digit: t.digit,
       quote: t.quote,
       epoch: t.epoch,
     }));
-    const liveItems = liveTapeBuffer.map((t) => ({
+    const live = liveTapeBuffer.map((t) => ({
       digit: t.lastDigit,
       quote: t.rawQuote,
       epoch: t.epoch,
     }));
-
-    // Merge without duplicates and slice to selected tickWindow
     const seen = new Set<string>();
     const merged: Array<{ digit: number; quote: string; epoch: number }> = [];
-    for (const item of [...baseTape, ...liveItems]) {
-      const key = `${item.epoch}:${item.quote}`;
-      if (!seen.has(key)) {
-        seen.add(key);
+    for (const item of [...base, ...live]) {
+      const k = `${item.epoch}:${item.quote}`;
+      if (!seen.has(k)) {
+        seen.add(k);
         merged.push(item);
       }
     }
-    const windowSlice = merged.slice(-tickWindow);
-    const total = windowSlice.length;
-
-    if (total === 0) {
-      return {
-        total: 0,
-        evenPct: 50,
-        oddPct: 50,
-        over4Pct: 50,
-        under5Pct: 50,
-        digits: Array.from({ length: 10 }, (_, d) => ({ digit: d, count: 0, percentage: 0 })),
-        tape20: [] as Array<{ digit: number; quote: string; epoch: number }>,
-      };
-    }
-
-    const counts = Array.from({ length: 10 }, () => 0);
-    let even = 0;
-    let over4 = 0;
-    for (const row of windowSlice) {
-      counts[row.digit] += 1;
-      if (row.digit % 2 === 0) even += 1;
-      if (row.digit > 4) over4 += 1;
-    }
-
+    const win = merged.slice(-100);
+    const counts = new Array<number>(10).fill(0);
+    for (const row of win) counts[row.digit] += 1;
+    const total = win.length;
     return {
       total,
-      evenPct: (even / total) * 100,
-      oddPct: ((total - even) / total) * 100,
-      over4Pct: (over4 / total) * 100,
-      under5Pct: ((total - over4) / total) * 100,
-      digits: counts.map((count, digit) => ({
+      bars: counts.map((c, digit) => ({
         digit,
-        count,
-        percentage: (count / total) * 100,
+        count: c,
+        pct: total > 0 ? (c / total) * 100 : 0,
       })),
-      tape20: windowSlice.slice(-20),
+      tape20: win.slice(-20),
     };
-  }, [digitsData, liveTapeBuffer, tickWindow]);
+  }, [digitsData, liveTapeBuffer]);
 
-  const hottestDigit = useMemo(() => {
-    if (liveDigitsComputation.total === 0) return null;
-    const top = [...liveDigitsComputation.digits].sort((a, b) => b.count - a.count)[0];
-    return { digit: top.digit, pct: top.percentage };
-  }, [liveDigitsComputation]);
+  // Watch liveContracts for settlement of bot trades -> update 2-win stake booster / min-loss reset
+  useEffect(() => {
+    if (liveContracts.length === 0) return;
 
-  const coldestDigit = useMemo(() => {
-    if (liveDigitsComputation.total === 0) return null;
-    const low = [...liveDigitsComputation.digits].sort((a, b) => a.count - b.count)[0];
-    return { digit: low.digit, pct: low.percentage };
-  }, [liveDigitsComputation]);
+    setSessionTrades((prev) =>
+      prev.map((tr) => {
+        const live = liveContracts.find((c) => c.contractId === tr.contractId);
+        if (!live) return tr;
+        return {
+          ...tr,
+          status: live.status,
+          profit: live.profit,
+          entrySpot: live.entrySpot,
+          exitSpot: live.currentSpot,
+        };
+      })
+    );
 
-  const deterministicVerdict = useMemo(() => {
-    const dir = quantData?.direction;
-    const conf = quantData ? Math.round(quantData.calibrated_confidence * 100) : 0;
-    const evenPct = liveDigitsComputation.evenPct;
-    const overPct = liveDigitsComputation.over4Pct;
+    for (const live of liveContracts) {
+      const tracked = sessionTrades.find((t) => t.contractId === live.contractId);
+      if (!tracked) continue;
+      if (live.status === 'open' || processedContractsRef.current.has(live.contractId)) continue;
 
-    if (dir === 'BUY' && conf >= 58) {
-      return {
-        title: `Upward Trend (${conf}% confidence)`,
-        tone: 'buy' as const,
-        reason: 'Recent candles show upward momentum above short-term average.',
-      };
+      processedContractsRef.current.add(live.contractId);
+      if (live.profit > 0) {
+        setConsecutiveWins((prevStreak) => {
+          const nextStreak = prevStreak + 1;
+          // Win twice consecutively -> add stake!
+          if (nextStreak >= 2 && nextStreak % 2 === 0) {
+            setCurrentStake((prevStake) => {
+              const boosted = Math.min(maxStakeCap, Number((prevStake + winStepAdd).toFixed(2)));
+              setStatusMessage(
+                `2 consecutive wins! Stake boosted to $${boosted.toFixed(2)} (+$${winStepAdd.toFixed(2)}).`
+              );
+              return boosted;
+            });
+          } else {
+            setStatusMessage(
+              `Win #${nextStreak} (+$${live.profit.toFixed(2)}). 1 more consecutive win to add stake.`
+            );
+          }
+          return nextStreak;
+        });
+      } else {
+        // Any loss -> immediate reset to minimum stake to avoid $10 drawdown
+        setConsecutiveWins(0);
+        setCurrentStake(minStake);
+        setStatusMessage(
+          `Loss ($${live.profit.toFixed(2)}). Stake reset immediately to minimum $${minStake.toFixed(2)} to protect your $10 drawdown cap.`
+        );
+      }
     }
-    if (dir === 'SELL' && conf >= 58) {
-      return {
-        title: `Downward Trend (${conf}% confidence)`,
-        tone: 'sell' as const,
-        reason: 'Recent candles show downward momentum below short-term average.',
-      };
-    }
-    if (Math.abs(evenPct - 50) >= 8 && liveDigitsComputation.total >= 20) {
-      const side = evenPct > 50 ? 'Even' : 'Odd';
-      return {
-        title: `${side} Digits Active (${Math.max(evenPct, 100 - evenPct).toFixed(0)}%)`,
-        tone: 'blue' as const,
-        reason: `In the last ${liveDigitsComputation.total} ticks, ${side.toLowerCase()} digits appeared more often.`,
-      };
-    }
-    if (Math.abs(overPct - 50) >= 8 && liveDigitsComputation.total >= 20) {
-      const side = overPct > 50 ? 'Over 4 (5–9)' : 'Under 5 (0–4)';
-      return {
-        title: `${side} Active (${Math.max(overPct, 100 - overPct).toFixed(0)}%)`,
-        tone: 'blue' as const,
-        reason: `Recent ticks leaned toward ${side} in this window.`,
-      };
-    }
-    return {
-      title: 'Balanced Market — Wait or Trade Small',
-      tone: 'neutral' as const,
-      reason: 'Neither trend nor digit counts show a strong skew right now.',
-    };
-  }, [quantData, liveDigitsComputation]);
+  }, [liveContracts, sessionTrades, maxStakeCap, winStepAdd, minStake]);
 
-  const handleAskAi = async () => {
-    setAiLoading(true);
-    setAiError(null);
+  // Execute a 5-phase scan ONLY across user's chosen markets (scanMarkets)
+  const runTargetedScan = useCallback(async (): Promise<RankedSignal | null> => {
+    const targets = scanMarkets.length > 0 ? scanMarkets : [selectedSymbol];
+    setScanning(true);
+    setScanPhaseIdx(0);
+    setDataError(null);
+
     try {
-      const matchBe = digitsData?.matchCandidates?.[0]?.breakEvenProbPct ?? null;
-      const differBe = digitsData?.differCandidates?.[0]?.breakEvenProbPct ?? null;
-      const brief = await dqiApi.generateAiBrief({
-        symbol: selectedSymbol,
-        spotQuote: displayQuote,
-        latestDigit: displayDigit,
-        tickWindowCount: liveDigitsComputation.total,
-        volatilityRegime: digitsData?.volatility.regime ?? 'NORMAL',
-        evenPct: liveDigitsComputation.evenPct,
-        oddPct: liveDigitsComputation.oddPct,
-        over4Pct: liveDigitsComputation.over4Pct,
-        under5Pct: liveDigitsComputation.under5Pct,
-        hottestDigit,
-        coldestDigit,
-        matchBreakEvenPct: matchBe,
-        differBreakEvenPct: differBe,
-        quantDirection: quantData?.direction ?? null,
-        quantConfidencePct: quantData ? quantData.calibrated_confidence * 100 : null,
-        quantRegime: quantData?.regime ?? null,
-        rsi14: quantData?.indicators.rsi14 ?? null,
-      });
-      setAiBrief(brief);
-    } catch (err) {
-      setAiError(err instanceof Error ? err.message : 'Unable to reach AI Analyst');
-    } finally {
-      setAiLoading(false);
-    }
-  };
+      const allRanked: RankedSignal[] = [];
 
-  const handlePlaceDerivTrade = async () => {
-    if (!derivSession.connected) {
-      onOpenConnect();
+      for (let idx = 0; idx < targets.length; idx += 1) {
+        const sym = targets[idx];
+        setScanPhaseIdx(Math.min(2, idx));
+        const res = await dqiApi.analyzeDigits(sym, 100, effectiveNextStake || minStake, 1);
+        setScanPhaseIdx(3);
+        const candidates = scoreCandidatesFromDigits(
+          sym,
+          marketNameFor(sym, symbols),
+          res,
+          strategyFilter
+        );
+        if (candidates.length > 0) {
+          allRanked.push(...candidates.slice(0, 4));
+        }
+        if (sym === selectedSymbol) {
+          setDigitsData(res);
+        }
+      }
+
+      setScanPhaseIdx(4);
+      allRanked.sort((a, b) => b.score - a.score);
+      setRankedSignals(allRanked);
+
+      const best = allRanked[0] ?? null;
+      if (best) {
+        setLockedSignal(best);
+        if (best.symbol !== selectedSymbol) {
+          onSelectSymbol(best.symbol);
+        }
+      }
+      return best;
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Scan failed — check Deriv connection');
+      return null;
+    } finally {
+      setScanning(false);
+    }
+  }, [scanMarkets, selectedSymbol, effectiveNextStake, minStake, symbols, strategyFilter, onSelectSymbol]);
+
+  const executeTradeSignal = useCallback(
+    async (signal: RankedSignal) => {
+      if (!derivSession.connected) {
+        onOpenConnect();
+        return;
+      }
+      if (drawdownLocked) {
+        setAutoRunning(false);
+        setStatusMessage('Stopped: $10.00 session drawdown limit reached. Reset session to resume.');
+        return;
+      }
+      if (!derivSession.activeIsVirtual && !realAccountOptIn) {
+        setStatusMessage('Tick the Real Account safety confirmation checkbox before placing a live trade.');
+        return;
+      }
+
+      const stakeToUse = effectiveNextStake;
+      if (stakeToUse < 0.35 || stakeToUse > drawdownRemaining) {
+        setAutoRunning(false);
+        setStatusMessage('Trade blocked to protect your $10.00 drawdown limit.');
+        return;
+      }
+
+      setTradeBusy(true);
+      setAskPromptSignal(null);
+      setStatusMessage(null);
+      try {
+        const contract = await dqiApi.buyDerivContract({
+          symbol: signal.symbol,
+          contractType: signal.contractType,
+          amount: stakeToUse,
+          duration: 1,
+          durationUnit: 't',
+          barrier: String(signal.digit),
+        });
+
+        setSessionTrades((prev) => [
+          {
+            contractId: contract.contractId,
+            symbol: signal.symbol,
+            contractType: signal.contractType,
+            digit: signal.digit,
+            stake: contract.buyPrice || stakeToUse,
+            status: contract.status,
+            profit: contract.profit,
+            entrySpot: contract.entrySpot,
+            exitSpot: contract.currentSpot,
+            isVirtual: contract.isVirtual,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+          ...prev.slice(0, 29),
+        ]);
+        setStatusMessage(
+          `Placed ${signal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit ${signal.digit} ($${stakeToUse.toFixed(2)}) on ${signal.symbolLabel}.`
+        );
+      } catch (err) {
+        setStatusMessage(err instanceof Error ? err.message : 'Order rejected by Deriv');
+        setAutoRunning(false);
+      } finally {
+        setTradeBusy(false);
+      }
+    },
+    [
+      derivSession.connected,
+      derivSession.activeIsVirtual,
+      drawdownLocked,
+      realAccountOptIn,
+      effectiveNextStake,
+      drawdownRemaining,
+      onOpenConnect,
+    ]
+  );
+
+  // Auto-Scan Loop for 'ASK' (Ask Me) and 'AUTO' (Auto Bot) modes
+  const hasOpenBotTrade = useMemo(() => sessionTrades.some((t) => t.status === 'open'), [sessionTrades]);
+
+  useEffect(() => {
+    if (!autoRunning) return;
+    if (botMode === 'MANUAL' || drawdownLocked) {
+      setAutoRunning(false);
       return;
     }
-    if (!derivSession.activeIsVirtual && !realTradeConfirm) {
-      setTradeMsg('Please tick the Real Account confirmation checkbox before placing a live trade.');
-      return;
-    }
+    if (botMode === 'ASK' && askPromptSignal) return; // Wait for user decision
+    if (tradeBusy || hasOpenBotTrade || scanning) return;
 
-    setTradeBusy(true);
-    setTradeMsg(null);
-    try {
-      const isDigit = tradeType === 'DIGITEVEN' || tradeType === 'DIGITODD' || tradeType === 'DIGITDIFF';
-      const contract = await dqiApi.buyDerivContract({
-        symbol: selectedSymbol,
-        contractType: tradeType,
-        amount: tradeStake,
-        duration: isDigit ? Math.min(10, Math.max(1, tradeDuration)) : tradeDuration,
-        durationUnit: isDigit ? 't' : tradeUnit,
-        barrier: tradeType === 'DIGITDIFF' ? String(tradeDigit) : undefined,
-      });
-      setRealTradeConfirm(false);
-      setTradeMsg(
-        `Opened #${contract.contractId} on ${contract.isVirtual ? 'Deriv Demo' : 'Deriv Real'} (${contract.loginid}). Live P&L updating tick-by-tick below.`
-      );
-    } catch (err) {
-      setTradeMsg(err instanceof Error ? err.message : 'Order execution failed');
-    } finally {
-      setTradeBusy(false);
-    }
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const best = await runTargetedScan();
+        if (!best) return;
+        if (best.score < minScoreThreshold) {
+          setStatusMessage(
+            `Scanned ${scanMarkets.join(', ')}: best score ${best.score} < ${minScoreThreshold} threshold. Waiting…`
+          );
+          return;
+        }
+        if (botMode === 'ASK') {
+          setAskPromptSignal(best);
+        } else if (botMode === 'AUTO') {
+          await executeTradeSignal(best);
+        }
+      })();
+    }, 3500);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    autoRunning,
+    botMode,
+    drawdownLocked,
+    askPromptSignal,
+    tradeBusy,
+    hasOpenBotTrade,
+    scanning,
+    minScoreThreshold,
+    scanMarkets,
+    runTargetedScan,
+    executeTradeSignal,
+  ]);
+
+  const toggleMarketInWatchlist = (code: string) => {
+    setScanMarkets((prev) => {
+      if (prev.includes(code)) {
+        if (prev.length === 1) return prev; // Keep at least 1 chosen market
+        const next = prev.filter((m) => m !== code);
+        if (selectedSymbol === code) onSelectSymbol(next[0]);
+        return next;
+      }
+      const next = [...prev, code];
+      onSelectSymbol(code);
+      return next;
+    });
   };
 
-  const handleSellEarly = async (contractId: number) => {
-    try {
-      await dqiApi.sellDerivContract(contractId);
-    } catch (err) {
-      setTradeMsg(err instanceof Error ? err.message : 'Unable to close contract early');
-    }
+  const resetSessionProgress = () => {
+    setSessionStartBalance(derivSession.activeBalance);
+    setSessionPeakBalance(derivSession.activeBalance);
+    setConsecutiveWins(0);
+    setCurrentStake(minStake);
+    setSessionTrades([]);
+    processedContractsRef.current.clear();
+    setAutoRunning(false);
+    setAskPromptSignal(null);
+    setStatusMessage('Session reset. Stake back at minimum and $10 drawdown guard cleared.');
   };
 
-  const volInfo = friendlyVolatility(digitsData?.volatility.regime);
-  const selectedMarketName =
-    symbols.find((s) => s.symbol === selectedSymbol)?.display_name ||
-    BEGINNER_MARKETS.find((m) => m.code === selectedSymbol)?.label ||
-    selectedSymbol;
+  const displayQuote = latestTick?.rawQuote ?? digitsData?.analytics.latestQuote ?? null;
+  const displayDigit = latestTick?.lastDigit ?? digitsData?.analytics.latestObservedDigit ?? null;
+  const quotePrefix = displayQuote && displayQuote.length > 1 ? displayQuote.slice(0, -1) : '';
+  const quoteLastChar = displayQuote ? displayQuote.slice(-1) : '';
 
-  const isDigitSelected = tradeType === 'DIGITEVEN' || tradeType === 'DIGITODD' || tradeType === 'DIGITDIFF';
+  const drawdownPct = Math.min(100, (drawdownUsed / maxDrawdown) * 100);
+  const potentialReturn =
+    liveProposal && liveProposal.askPrice > 0
+      ? Number((liveProposal.payout - liveProposal.askPrice).toFixed(2))
+      : null;
 
   return (
     <div className="space-y-4">
-      {/* Step 1: Simple Market & Speed Selector Bar */}
+      {/* Top 4-Control Bar: User-Chosen Markets · Strategy · Bot Mode · Scan */}
       <div className="rounded-lg border border-[#E5E9EF] bg-white p-4 dark:border-[#243040] dark:bg-[#151D27]">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 className="text-base font-bold text-[#20242B] dark:text-white">
-              AI Market Analyser Bot
-            </h1>
-            <p className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-              Real-time Deriv quotes, tick-by-tick calculations, AI explanation, and direct Demo/Real account execution.
-            </p>
-          </div>
-
+          {/* Control 1: Market Selector (User chooses exact market to scan) */}
           <div className="flex flex-wrap items-center gap-2">
             <select
-              aria-label="Tick sample size"
-              value={tickWindow}
-              onChange={(e) => setTickWindow(Number(e.target.value))}
-              className="rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-2.5 py-1.5 text-xs font-medium text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]"
+              aria-label="Select primary market to scan"
+              value={selectedSymbol}
+              onChange={(e) => {
+                const code = e.target.value;
+                onSelectSymbol(code);
+                if (!scanMarkets.includes(code)) {
+                  setScanMarkets([code]);
+                }
+              }}
+              className="rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-2 text-xs font-semibold text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
             >
-              <option value={50}>Last 50 Ticks</option>
-              <option value={100}>Last 100 Ticks</option>
-              <option value={250}>Last 250 Ticks</option>
+              {CORE_MARKETS.map((m) => (
+                <option key={m.code} value={m.code}>
+                  {m.label} ({m.code})
+                </option>
+              ))}
+              {symbols
+                .filter((s) => !CORE_MARKETS.some((m) => m.code === s.symbol))
+                .map((s) => (
+                  <option key={s.symbol} value={s.symbol}>
+                    {s.display_name} ({s.symbol})
+                  </option>
+                ))}
             </select>
 
-            <select
-              aria-label="Chart timeframe"
-              value={chartTimeframe}
-              onChange={(e) => setChartTimeframe(e.target.value)}
-              className="rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-2.5 py-1.5 text-xs font-medium text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]"
-            >
-              <option value="M1">1m Trend</option>
-              <option value="M5">5m Trend</option>
-              <option value="M15">15m Trend</option>
-              <option value="H1">1h Trend</option>
-            </select>
+            {/* Control 2: Match / Differ Strategy Filter */}
+            <div className="flex items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
+              {(
+                [
+                  { id: 'BEST', label: 'Best (M+D)' },
+                  { id: 'DIGITMATCH', label: 'Matches' },
+                  { id: 'DIGITDIFF', label: 'Differs' },
+                ] as const
+              ).map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setStrategyFilter(opt.id)}
+                  className={`whitespace-nowrap rounded px-2.5 py-1.5 text-xs font-semibold transition ${
+                    strategyFilter === opt.id
+                      ? 'bg-[#0866FF] text-white'
+                      : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
 
-            <button
-              type="button"
-              onClick={() => void loadAnalysis()}
-              disabled={loadingData}
-              className="inline-flex items-center gap-1.5 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-1.5 text-xs font-semibold text-[#20242B] hover:bg-[#EAEFF5] disabled:opacity-50 dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]"
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${loadingData ? 'animate-spin' : ''}`} />
-              Refresh
-            </button>
+          {/* Control 3 & 4: Mode Selector + Primary Scan/Bot Button */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
+              {(
+                [
+                  { id: 'MANUAL', label: 'Manual' },
+                  { id: 'ASK', label: 'Ask Me' },
+                  { id: 'AUTO', label: 'Auto Bot' },
+                ] as const
+              ).map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => {
+                    setBotMode(m.id);
+                    if (m.id === 'MANUAL') {
+                      setAutoRunning(false);
+                      setAskPromptSignal(null);
+                    }
+                  }}
+                  className={`whitespace-nowrap rounded px-2.5 py-1.5 text-xs font-semibold transition ${
+                    botMode === m.id
+                      ? 'bg-[#101820] text-white dark:bg-[#0866FF]'
+                      : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {botMode === 'MANUAL' ? (
+              <button
+                type="button"
+                disabled={scanning}
+                onClick={() => void runTargetedScan()}
+                className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md bg-[#0866FF] px-4 py-2 text-xs font-bold text-white hover:bg-[#0654d4] disabled:opacity-50"
+              >
+                <Radar className={`h-3.5 w-3.5 ${scanning ? 'animate-spin' : ''}`} />
+                {scanning ? 'Scanning…' : 'Scan Selected Market'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={drawdownLocked}
+                onClick={() => {
+                  if (autoRunning) {
+                    setAutoRunning(false);
+                  } else {
+                    setAutoRunning(true);
+                    void runTargetedScan();
+                  }
+                }}
+                className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-4 py-2 text-xs font-bold text-white disabled:opacity-50 ${
+                  autoRunning
+                    ? 'bg-[#FF444F] hover:bg-[#e53843]'
+                    : 'bg-[#00A88F] hover:bg-[#00917b]'
+                }`}
+              >
+                {autoRunning ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                {autoRunning ? 'Stop Scanner' : botMode === 'ASK' ? 'Start Ask-Me Scan' : 'Start Auto Bot'}
+              </button>
+            )}
           </div>
         </div>
 
-        {/* Beginner Quick Market Buttons + Full Searchable Select */}
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          {BEGINNER_MARKETS.map((m) => {
-            const active = selectedSymbol === m.code;
+        {/* Focused Custom Market Watchlist (Scan ONLY what you pick — never random markets) */}
+        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-[#E5E9EF] pt-3 text-xs dark:border-[#243040]">
+          <span className="mr-1 text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+            Bot Scan List:
+          </span>
+          {CORE_MARKETS.slice(0, 6).map((m) => {
+            const included = scanMarkets.includes(m.code);
             return (
               <button
                 key={m.code}
                 type="button"
-                onClick={() => onSelectSymbol(m.code)}
-                className={`whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-semibold transition ${
-                  active
-                    ? 'bg-[#0866FF] text-white'
-                    : 'border border-[#E5E9EF] bg-[#F5F7FA] text-[#20242B] hover:border-[#0866FF]/50 dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
+                onClick={() => toggleMarketInWatchlist(m.code)}
+                className={`whitespace-nowrap rounded px-2 py-1 text-[11px] font-semibold transition ${
+                  included
+                    ? 'bg-[#0866FF]/12 text-[#0866FF] ring-1 ring-[#0866FF]/40'
+                    : 'bg-[#F5F7FA] text-[#6B7280] hover:text-[#20242B] dark:bg-[#0F151D] dark:text-[#9CA3AF]'
                 }`}
               >
                 {m.label}
               </button>
             );
           })}
-
-          {symbols.length > 0 && (
-            <select
-              aria-label="All Deriv markets"
-              value={selectedSymbol}
-              onChange={(e) => onSelectSymbol(e.target.value)}
-              className="max-w-[230px] rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-2.5 py-1.5 text-xs text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]"
-            >
-              {symbols.map((s) => (
-                <option key={s.symbol} value={s.symbol}>
-                  {s.display_name} ({s.symbol})
-                </option>
-              ))}
-            </select>
-          )}
         </div>
       </div>
 
@@ -467,193 +828,243 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         </div>
       )}
 
-      {/* Main 2-Column Easy View */}
+      {/* Main 2-Column Workspace */}
       <div className="grid grid-cols-1 items-stretch gap-4 lg:grid-cols-12">
-        {/* LEFT (7 cols): Live Real-Time Analyser Dashboard */}
+        {/* LEFT (7 cols): Live Signal Analyzer & 0-9 Digit Matrix */}
         <div className="flex flex-col justify-between space-y-4 rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27] lg:col-span-7">
           <div>
-            {/* Live Price + Big Digit Tile */}
+            {/* Latest Tick Header */}
             <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#E5E9EF] pb-4 dark:border-[#243040]">
               <div>
                 <div className="text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                  {selectedMarketName} · Live Tick Feed ({liveDigitsComputation.total} ticks)
+                  {marketNameFor(selectedSymbol, symbols)} · {liveDigits.total} live ticks
                 </div>
-                <div className="mt-1 font-mono text-2xl font-bold tabular-nums text-[#20242B] dark:text-white">
-                  {displayQuote ?? 'Connecting to Deriv…'}
+                <div className="mt-1 font-mono text-3xl font-bold tabular-nums text-[#20242B] dark:text-white">
+                  {displayQuote ? (
+                    <>
+                      <span>{quotePrefix}</span>
+                      <span className="ml-0.5 rounded bg-[#0866FF] px-1.5 py-0.5 text-white">
+                        {quoteLastChar}
+                      </span>
+                    </>
+                  ) : (
+                    'Connecting…'
+                  )}
                 </div>
               </div>
 
-              <div className="flex items-center gap-3">
-                <div className="text-right">
-                  <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Latest Last Digit</div>
-                  <div className="text-xs font-medium text-[#20242B] dark:text-[#F3F4F6]">
-                    {displayDigit !== null
-                      ? `${displayDigit % 2 === 0 ? 'Even' : 'Odd'} · ${displayDigit > 4 ? 'Over 4' : 'Under 5'}`
-                      : 'Waiting'}
-                  </div>
-                </div>
-                <div className="flex h-14 w-14 items-center justify-center rounded-lg bg-[#101820] font-mono text-2xl font-bold tabular-nums text-white dark:bg-[#0866FF]">
-                  {displayDigit !== null ? displayDigit : '—'}
-                </div>
-              </div>
-            </div>
-
-            {/* Clear Bot Verdict Banner */}
-            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-md bg-[#F5F7FA] p-3.5 dark:bg-[#0F151D]">
-              <div className="flex items-start gap-2.5">
-                {deterministicVerdict.tone === 'buy' ? (
-                  <ArrowUpRight className="mt-0.5 h-5 w-5 shrink-0 text-[#00A88F]" />
-                ) : deterministicVerdict.tone === 'sell' ? (
-                  <ArrowDownRight className="mt-0.5 h-5 w-5 shrink-0 text-[#FF4D5A]" />
-                ) : (
-                  <Bot className="mt-0.5 h-5 w-5 shrink-0 text-[#0866FF]" />
-                )}
+              <div className="flex items-center gap-5 text-right font-mono text-xs tabular-nums">
                 <div>
-                  <div className="text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                    Live Bot Signal
-                  </div>
-                  <div
-                    className={`text-sm font-bold ${
-                      deterministicVerdict.tone === 'buy'
-                        ? 'text-[#00A88F]'
-                        : deterministicVerdict.tone === 'sell'
-                        ? 'text-[#FF4D5A]'
-                        : 'text-[#20242B] dark:text-white'
-                    }`}
-                  >
-                    {deterministicVerdict.title}
-                  </div>
-                  <div className="mt-0.5 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                    {deterministicVerdict.reason}
+                  <div className="text-[11px] font-sans text-[#6B7280] dark:text-[#9CA3AF]">Entropy</div>
+                  <div className="font-bold text-[#20242B] dark:text-white">
+                    {digitsData ? `${digitsData.analytics.entropyBits.toFixed(2)} b` : '—'}
                   </div>
                 </div>
-              </div>
-
-              <div className="text-right">
-                <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Market Speed</div>
-                <div className="text-xs font-semibold text-[#20242B] dark:text-[#F3F4F6]">
-                  {volInfo.label}
-                </div>
-                <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">{volInfo.hint}</div>
-              </div>
-            </div>
-
-            {/* Even/Odd & Over/Under Live Balance Bars */}
-            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <div className="flex justify-between font-mono text-xs font-medium tabular-nums">
-                  <span className="text-[#00A88F]">
-                    Even {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.evenPct.toFixed(1)}%` : '—'}
-                  </span>
-                  <span className="text-[#0866FF]">
-                    Odd {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.oddPct.toFixed(1)}%` : '—'}
-                  </span>
-                </div>
-                <div className="mt-1.5 flex h-2.5 overflow-hidden rounded bg-[#E5E9EF] dark:bg-[#243040]">
-                  <div className="bg-[#00A88F]" style={{ width: `${liveDigitsComputation.evenPct}%` }} />
-                  <div className="bg-[#0866FF]" style={{ width: `${liveDigitsComputation.oddPct}%` }} />
-                </div>
-              </div>
-
-              <div>
-                <div className="flex justify-between font-mono text-xs font-medium tabular-nums">
-                  <span className="text-[#08B9E6]">
-                    Over 4 {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.over4Pct.toFixed(1)}%` : '—'}
-                  </span>
-                  <span className="text-[#FF4D5A]">
-                    Under 5 {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.under5Pct.toFixed(1)}%` : '—'}
-                  </span>
-                </div>
-                <div className="mt-1.5 flex h-2.5 overflow-hidden rounded bg-[#E5E9EF] dark:bg-[#243040]">
-                  <div className="bg-[#08B9E6]" style={{ width: `${liveDigitsComputation.over4Pct}%` }} />
-                  <div className="bg-[#FF4D5A]" style={{ width: `${liveDigitsComputation.under5Pct}%` }} />
+                <div>
+                  <div className="text-[11px] font-sans text-[#6B7280] dark:text-[#9CA3AF]">Speed</div>
+                  <div className="font-bold text-[#20242B] dark:text-white">
+                    {digitsData?.volatility.regime || 'LIVE'}
+                  </div>
                 </div>
               </div>
             </div>
 
-            {/* 0–9 Real-Time Digit Frequency Bars */}
-            <div className="mt-5">
+            {/* Locked Signal Ready Panel */}
+            <div className="mt-4 rounded-lg border border-[#E5E9EF] bg-[#F5F7FA] p-4 dark:border-[#243040] dark:bg-[#0F151D]">
+              {scanning ? (
+                <div className="flex items-center justify-between gap-4 py-2">
+                  <div>
+                    <div className="text-xs font-bold text-[#0866FF]">
+                      Phase {scanPhaseIdx + 1}/5 · {SCAN_PHASES[scanPhaseIdx]}
+                    </div>
+                    <div className="mt-1 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                      Scanning only your selected market(s): {scanMarkets.join(', ')}
+                    </div>
+                  </div>
+                  <div className="font-mono text-lg font-bold tabular-nums text-[#0866FF]">
+                    {Math.round(((scanPhaseIdx + 1) / 5) * 100)}%
+                  </div>
+                </div>
+              ) : lockedSignal ? (
+                <div className="flex flex-wrap items-center justify-between gap-4">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-[#6B7280] dark:text-[#9CA3AF]">
+                      <span>{lockedSignal.symbolLabel}</span>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        {lockedSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'}
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span
+                        className={
+                          lockedSignal.strength === 'STRONG'
+                            ? 'text-[#00A88F]'
+                            : lockedSignal.strength === 'MODERATE'
+                            ? 'text-[#0866FF]'
+                            : 'text-[#FFAD3A]'
+                        }
+                      >
+                        {lockedSignal.strength}
+                      </span>
+                    </div>
+
+                    <div className="mt-1 flex items-baseline gap-2.5">
+                      <span className="text-lg font-bold text-[#20242B] dark:text-white">
+                        {lockedSignal.contractType === 'DIGITMATCH' ? 'Digit Matches' : 'Digit Differs'}{' '}
+                        <span className="font-mono text-[#0866FF]">DIGIT {lockedSignal.digit}</span>
+                      </span>
+                    </div>
+
+                    <div className="mt-1 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                      {lockedSignal.reason}
+                    </div>
+                  </div>
+
+                  {/* Signal Score Dial */}
+                  <div className="flex shrink-0 items-center gap-3 rounded-lg border border-[#E5E9EF] bg-white px-4 py-2.5 dark:border-[#243040] dark:bg-[#151D27]">
+                    <div className="text-center">
+                      <div className="font-mono text-2xl font-bold tabular-nums text-[#0866FF]">
+                        {lockedSignal.score}
+                      </div>
+                      <div className="text-[10px] font-semibold uppercase tracking-wide text-[#6B7280] dark:text-[#9CA3AF]">
+                        Score
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                  Click <strong>Scan Selected Market</strong> to analyze your chosen market and lock the best Match / Differ digit.
+                </div>
+              )}
+
+              {/* Top 3 Candidates Quick-Select Strip */}
+              {rankedSignals.length > 1 && !scanning && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
+                  <span className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                    Top Picks:
+                  </span>
+                  {rankedSignals.slice(0, 3).map((cand) => {
+                    const isPicked =
+                      lockedSignal?.symbol === cand.symbol &&
+                      lockedSignal?.contractType === cand.contractType &&
+                      lockedSignal?.digit === cand.digit;
+                    return (
+                      <button
+                        key={`${cand.symbol}-${cand.contractType}-${cand.digit}`}
+                        type="button"
+                        onClick={() => {
+                          setLockedSignal(cand);
+                          if (cand.symbol !== selectedSymbol) onSelectSymbol(cand.symbol);
+                        }}
+                        className={`rounded px-2.5 py-1 font-mono text-[11px] font-semibold tabular-nums transition ${
+                          isPicked
+                            ? 'bg-[#0866FF] text-white'
+                            : 'border border-[#E5E9EF] bg-white text-[#20242B] hover:border-[#0866FF] dark:border-[#243040] dark:bg-[#151D27] dark:text-[#F3F4F6]'
+                        }`}
+                      >
+                        {cand.contractType === 'DIGITMATCH' ? 'MATCH' : 'DIFF'} {cand.digit} ({cand.score})
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* 0–9 Interactive Frequency Strip */}
+            <div className="mt-4">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-[#20242B] dark:text-[#F3F4F6]">
-                  Live Last-Digit Frequency (0–9) · Click a digit to select Differ
+                  Live Digit Distribution (0–9) · Tap any digit to target
                 </span>
                 <span className="font-mono text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                  Baseline: 10.0%
+                  10.0% baseline
                 </span>
               </div>
 
-              <div className="mt-3 grid grid-cols-10 gap-1.5">
-                {liveDigitsComputation.digits.map((row) => {
-                  const isLatest = displayDigit === row.digit;
-                  const isHighest = hottestDigit?.digit === row.digit && row.count > 0;
-                  const isLowest = coldestDigit?.digit === row.digit && row.count > 0;
-                  const barHeight = Math.min(100, Math.max(8, (row.percentage / 22) * 100));
+              <div className="mt-2.5 grid grid-cols-10 gap-1.5">
+                {liveDigits.bars.map((bar) => {
+                  const isTarget = activeDigit === bar.digit;
+                  const isLatest = displayDigit === bar.digit;
+                  const height = Math.min(100, Math.max(10, (bar.pct / 22) * 100));
                   return (
                     <button
-                      key={row.digit}
+                      key={bar.digit}
                       type="button"
                       onClick={() => {
-                        setTradeDigit(row.digit);
-                        setTradeType('DIGITDIFF');
+                        const modeType: 'DIGITMATCH' | 'DIGITDIFF' =
+                          strategyFilter === 'DIGITMATCH' ? 'DIGITMATCH' : 'DIGITDIFF';
+                        setLockedSignal({
+                          symbol: selectedSymbol,
+                          symbolLabel: marketNameFor(selectedSymbol, symbols),
+                          contractType: lockedSignal?.contractType || modeType,
+                          digit: bar.digit,
+                          score: lockedSignal?.score ?? 75,
+                          strength: 'MODERATE',
+                          observedPct: bar.pct,
+                          avoidPct: Number((100 - bar.pct).toFixed(1)),
+                          lastSeenTicksAgo: null,
+                          payout: liveProposal?.payout ?? null,
+                          askPrice: liveProposal?.askPrice ?? null,
+                          reason: `Manual digit ${bar.digit} selected (${bar.pct.toFixed(1)}% observed in last ${liveDigits.total} ticks)`,
+                        });
                       }}
                       className={`flex flex-col items-center rounded-md border p-1.5 transition ${
-                        isLatest
-                          ? 'border-[#0866FF] bg-[#0866FF]/10'
+                        isTarget
+                          ? 'border-[#0866FF] bg-[#0866FF]/10 ring-1 ring-[#0866FF]'
+                          : isLatest
+                          ? 'border-[#00A88F] bg-[#00A88F]/8'
                           : 'border-[#E5E9EF] bg-[#F5F7FA] hover:border-[#0866FF]/50 dark:border-[#243040] dark:bg-[#0F151D]'
                       }`}
                     >
-                      <span className="font-mono text-[11px] tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
-                        {row.percentage.toFixed(0)}%
+                      <span className="font-mono text-[10px] tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
+                        {bar.pct.toFixed(0)}%
                       </span>
-                      <div className="my-1.5 flex h-16 w-full items-end justify-center">
+                      <div className="my-1.5 flex h-14 w-full items-end justify-center">
                         <div
-                          className={`w-3.5 rounded-t ${
-                            isHighest
-                              ? 'bg-[#FF444F]'
-                              : isLowest
+                          className={`w-3 rounded-t ${
+                            isTarget
+                              ? 'bg-[#0866FF]'
+                              : isLatest
                               ? 'bg-[#00A88F]'
-                              : 'bg-[#0866FF]'
+                              : 'bg-[#6B7280]/50 dark:bg-[#9CA3AF]/40'
                           }`}
-                          style={{ height: `${barHeight}%` }}
+                          style={{ height: `${height}%` }}
                         />
                       </div>
                       <span className="font-mono text-xs font-bold tabular-nums text-[#20242B] dark:text-white">
-                        {row.digit}
+                        {bar.digit}
                       </span>
                     </button>
                   );
                 })}
               </div>
-              <p className="mt-2 text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                Updates every tick in real time. Red = highest frequency · Green = lowest frequency. Past ticks never predict the next tick.
-              </p>
             </div>
           </div>
 
-          {/* Live Last 20 Digits Tape */}
+          {/* Last 20 Digits Tape */}
           <div className="border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
             <div className="mb-1.5 text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-              Live Tick Stream (Newest on right)
+              Latest 20 Digits
             </div>
             <div className="flex flex-wrap gap-1">
-              {liveDigitsComputation.tape20.length === 0 ? (
+              {liveDigits.tape20.length === 0 ? (
                 <span className="text-xs text-[#6B7280]">Waiting for incoming ticks…</span>
               ) : (
-                liveDigitsComputation.tape20.map((item, idx) => {
-                  const isNewest = idx === liveDigitsComputation.tape20.length - 1;
+                liveDigits.tape20.map((t, idx) => {
+                  const isNewest = idx === liveDigits.tape20.length - 1;
                   return (
                     <span
-                      key={`${item.epoch}-${idx}`}
-                      title={item.quote}
+                      key={`${t.epoch}-${idx}`}
                       className={`flex h-7 w-7 items-center justify-center rounded font-mono text-xs font-bold tabular-nums ${
                         isNewest
                           ? 'bg-[#0866FF] text-white'
-                          : item.digit % 2 === 0
-                          ? 'bg-[#00A88F]/15 text-[#00A88F]'
+                          : t.digit === activeDigit
+                          ? 'bg-[#00A88F]/20 text-[#00A88F]'
                           : 'bg-[#F5F7FA] text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
                       }`}
                     >
-                      {item.digit}
+                      {t.digit}
                     </span>
                   );
                 })
@@ -662,238 +1073,240 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
           </div>
         </div>
 
-        {/* RIGHT (5 cols): AI Market Brief + Live Deriv Demo / Real Trading Panel */}
+        {/* RIGHT (5 cols): Controlled Bot + 2-Win Stake Booster + $10 Drawdown Guard + Account Progress */}
         <div className="flex flex-col justify-between space-y-4 lg:col-span-5">
-          {/* AI Analyst Brief */}
+          {/* Account Progress & $10 Max Drawdown Guard */}
           <div className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <Sparkles className="h-4 w-4 text-[#0866FF]" />
-                <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
-                  AI Market Explanation
-                </h2>
-              </div>
-              <button
-                type="button"
-                onClick={handleAskAi}
-                disabled={aiLoading}
-                className="inline-flex items-center gap-1.5 rounded-md bg-[#0866FF] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#0654d4] disabled:opacity-50"
-              >
-                <Bot className="h-3.5 w-3.5" />
-                {aiLoading ? 'Analyzing…' : aiBrief ? 'Re-Analyze' : 'Ask AI Analyst'}
-              </button>
-            </div>
-
-            {aiError && (
-              <div className="mt-3 rounded-md border border-[#FF444F]/40 bg-[#FF444F]/10 p-3 text-xs text-[#FF444F]">
-                {aiError}
-              </div>
-            )}
-
-            {!aiBrief && !aiError && (
-              <div className="mt-3 rounded-md bg-[#F5F7FA] p-3.5 text-xs text-[#6B7280] dark:bg-[#0F151D] dark:text-[#9CA3AF]">
-                Click <strong>Ask AI Analyst</strong> for a plain-English summary of the live quotes, digit frequencies, and trend indicators.
-              </div>
-            )}
-
-            {aiBrief && (
-              <div className="mt-3 space-y-2.5 text-xs">
-                <div className="rounded-md bg-[#F5F7FA] p-3 dark:bg-[#0F151D]">
-                  <div className="font-bold text-[#20242B] dark:text-white">{aiBrief.headline}</div>
-                  <p className="mt-1 leading-relaxed text-[#6B7280] dark:text-[#9CA3AF]">
-                    {aiBrief.plainSummary}
-                  </p>
-                  <div className="mt-2 font-semibold text-[#0866FF]">
-                    Suggested Setup: {aiBrief.bestSetup}
-                  </div>
-                </div>
-
-                {aiBrief.whyBullets.length > 0 && (
-                  <ul className="space-y-1 pl-4 text-[#20242B] dark:text-[#D1D5DB]">
-                    {aiBrief.whyBullets.map((b, i) => (
-                      <li key={i} className="list-disc">
-                        {b}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                <div className="flex items-start gap-2 rounded-md border border-[#00A88F]/30 bg-[#00A88F]/8 p-2.5 text-[#00A88F]">
-                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>{aiBrief.beginnerTip}</span>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Real Deriv Demo / Real Live Trade Execution & Tick-by-Tick P&L */}
-          <div className="flex-1 rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
-                  {derivSession.connected
-                    ? `Trade on Deriv ${derivSession.activeIsVirtual ? 'Demo' : 'REAL'} (${derivSession.activeLoginId})`
-                    : 'Connect Deriv Account to Trade'}
+                  Account Progress
                 </h2>
-                <p className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                  {derivSession.connected ? (
-                    <>
-                      Live Balance:{' '}
-                      <span
-                        className={`font-mono font-bold tabular-nums ${
-                          derivSession.activeIsVirtual ? 'text-[#00A88F]' : 'text-[#FF444F]'
-                        }`}
-                      >
-                        {derivSession.activeBalance !== null
-                          ? `${derivSession.activeBalance.toFixed(2)} ${derivSession.activeCurrency}`
-                          : 'Loading…'}
-                      </span>
-                    </>
-                  ) : (
-                    'Log in with Deriv OAuth or API Token to trade live Demo first, then switch to Real.'
-                  )}
-                </p>
+                <div className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                  {derivSession.connected
+                    ? `${derivSession.activeIsVirtual ? 'Demo' : 'Real'} (${derivSession.activeLoginId})`
+                    : 'Connect Deriv to track live balance'}
+                </div>
               </div>
-              {derivSession.connected ? (
-                <CheckCircle2 className="h-4 w-4 text-[#00A88F]" />
-              ) : (
-                <Wallet className="h-4 w-4 text-[#0866FF]" />
-              )}
+              <button
+                type="button"
+                onClick={resetSessionProgress}
+                className="inline-flex items-center gap-1 rounded border border-[#E5E9EF] px-2.5 py-1 text-[11px] font-semibold text-[#6B7280] hover:text-[#20242B] dark:border-[#243040] dark:text-[#9CA3AF] dark:hover:text-white"
+              >
+                <RotateCcw className="h-3 w-3" />
+                Reset
+              </button>
             </div>
 
-            {!derivSession.connected ? (
-              <div className="mt-4 space-y-3 rounded-md bg-[#F5F7FA] p-4 dark:bg-[#0F151D]">
-                <p className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                  Connect your actual Deriv account to view your <strong>Demo (VRTC)</strong> &amp; <strong>Real (CR)</strong> balances, execute trades, and see real-time profit/loss calculate on every tick.
-                </p>
+            <div className="mt-3 grid grid-cols-3 gap-2 rounded-md bg-[#F5F7FA] p-3 font-mono text-xs tabular-nums dark:bg-[#0F151D]">
+              <div>
+                <div className="font-sans text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Session P&amp;L</div>
+                <div
+                  className={`mt-0.5 text-sm font-bold ${
+                    sessionRealizedPnl >= 0 ? 'text-[#00A88F]' : 'text-[#FF4D5A]'
+                  }`}
+                >
+                  {sessionRealizedPnl >= 0 ? '+' : ''}${sessionRealizedPnl.toFixed(2)}
+                </div>
+              </div>
+              <div>
+                <div className="font-sans text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Win / Loss</div>
+                <div className="mt-0.5 text-sm font-bold text-[#20242B] dark:text-white">
+                  {winsCount}W / {lossesCount}L
+                </div>
+              </div>
+              <div>
+                <div className="font-sans text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Win Streak</div>
+                <div className="mt-0.5 text-sm font-bold text-[#0866FF]">
+                  {consecutiveWins} {consecutiveWins >= 2 ? '(Boosted)' : '/ 2'}
+                </div>
+              </div>
+            </div>
+
+            {/* $10.00 Drawdown Safety Meter */}
+            <div className="mt-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="flex items-center gap-1 font-semibold text-[#20242B] dark:text-[#F3F4F6]">
+                  <ShieldCheck className="h-3.5 w-3.5 text-[#00A88F]" />
+                  $10.00 Drawdown Protection
+                </span>
+                <span className="font-mono text-xs font-bold tabular-nums text-[#20242B] dark:text-white">
+                  ${drawdownUsed.toFixed(2)} / ${maxDrawdown.toFixed(2)}
+                </span>
+              </div>
+              <div className="mt-1.5 h-2 overflow-hidden rounded bg-[#E5E9EF] dark:bg-[#243040]">
+                <div
+                  className={`h-full transition-all ${
+                    drawdownPct >= 80
+                      ? 'bg-[#FF444F]'
+                      : drawdownPct >= 50
+                      ? 'bg-[#FFAD3A]'
+                      : 'bg-[#00A88F]'
+                  }`}
+                  style={{ width: `${drawdownPct}%` }}
+                />
+              </div>
+              <div className="mt-1 flex justify-between text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+                <span>Safe buffer left: ${drawdownRemaining.toFixed(2)}</span>
+                <span>
+                  Start: {sessionStartBalance !== null ? `$${sessionStartBalance.toFixed(2)}` : '—'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Controlled Bot Execution Card */}
+          <div className="flex-1 rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
+                Match &amp; Differ Bot
+              </h2>
+              <span className="font-mono text-xs font-bold tabular-nums text-[#0866FF]">
+                Next Stake: ${effectiveNextStake.toFixed(2)}
+              </span>
+            </div>
+
+            {/* Strategy Rules Summary (3 clean inputs) */}
+            <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+              <div>
+                <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                  Min Stake ($)
+                </label>
+                <div className="mt-1 flex gap-1">
+                  {MIN_STAKE_PRESETS.map((amt) => (
+                    <button
+                      key={amt}
+                      type="button"
+                      onClick={() => setMinStake(amt)}
+                      className={`flex-1 rounded py-1 font-mono text-[11px] font-semibold tabular-nums ${
+                        minStake === amt
+                          ? 'bg-[#101820] text-white dark:bg-[#0866FF]'
+                          : 'border border-[#E5E9EF] bg-[#F5F7FA] text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white'
+                      }`}
+                    >
+                      ${amt}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                  +Add After 2 Wins
+                </label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min={0}
+                  max={5}
+                  value={winStepAdd}
+                  onChange={(e) => setWinStepAdd(Math.max(0, Number(e.target.value)))}
+                  className="mt-1 w-full rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 font-mono text-xs tabular-nums text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                  Max Stake Cap
+                </label>
+                <input
+                  type="number"
+                  step="0.25"
+                  min={0.35}
+                  max={5}
+                  value={maxStakeCap}
+                  onChange={(e) => setMaxStakeCap(Math.max(0.35, Number(e.target.value)))}
+                  className="mt-1 w-full rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 font-mono text-xs tabular-nums text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                />
+              </div>
+            </div>
+
+            {/* Ask-Me Confirmation Banner when bot finds a strong signal */}
+            {askPromptSignal && !drawdownLocked && (
+              <div className="mt-3 rounded-md border border-[#0866FF] bg-[#0866FF]/10 p-3 text-xs">
+                <div className="font-bold text-[#20242B] dark:text-white">
+                  Signal Found: {askPromptSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit{' '}
+                  {askPromptSignal.digit} on {askPromptSignal.symbolLabel} (Score {askPromptSignal.score})
+                </div>
+                <div className="mt-2 flex gap-2">
+                  <button
+                    type="button"
+                    disabled={tradeBusy}
+                    onClick={() => void executeTradeSignal(askPromptSignal)}
+                    className="flex-1 rounded bg-[#00A88F] px-3 py-2 font-bold text-white hover:bg-[#00917b] disabled:opacity-50"
+                  >
+                    Place Trade (${effectiveNextStake.toFixed(2)})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAskPromptSignal(null)}
+                    className="rounded border border-[#E5E9EF] bg-white px-3 py-2 font-semibold text-[#20242B] dark:border-[#243040] dark:bg-[#151D27] dark:text-white"
+                  >
+                    Skip
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Live Deriv Payout Preview */}
+            {liveProposal && !drawdownLocked && (
+              <div className="mt-3 flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 font-mono text-xs tabular-nums dark:bg-[#0F151D]">
+                <span className="text-[#6B7280] dark:text-[#9CA3AF]">
+                  Payout: <strong className="text-[#20242B] dark:text-white">${liveProposal.payout.toFixed(2)}</strong>
+                </span>
+                <span className="text-[#6B7280] dark:text-[#9CA3AF]">
+                  Net Win:{' '}
+                  <strong className="text-[#00A88F]">
+                    {potentialReturn !== null ? `+$${potentialReturn.toFixed(2)}` : '—'}
+                  </strong>
+                </span>
+              </div>
+            )}
+
+            {/* Real Account Safety Opt-in */}
+            {derivSession.connected && !derivSession.activeIsVirtual && (
+              <label className="mt-3 flex items-center gap-2 rounded border border-[#FF444F]/40 bg-[#FF444F]/10 px-3 py-2 text-xs text-[#FF444F]">
+                <input
+                  type="checkbox"
+                  checked={realAccountOptIn}
+                  onChange={(e) => setRealAccountOptIn(e.target.checked)}
+                  className="h-4 w-4 accent-[#FF444F]"
+                />
+                <span>Confirm bot trades on REAL balance ({derivSession.activeLoginId})</span>
+              </label>
+            )}
+
+            {/* Primary Execution Button */}
+            <div className="mt-3">
+              {!derivSession.connected ? (
                 <button
                   type="button"
                   onClick={onOpenConnect}
                   className="flex w-full items-center justify-center gap-2 rounded-md bg-[#0866FF] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#0654d4]"
                 >
                   <Wallet className="h-4 w-4" />
-                  Connect Deriv Demo &amp; Real Account
+                  Connect Deriv to Trade
                 </button>
-              </div>
-            ) : (
-              <div className="mt-3 space-y-3">
-                <div>
-                  <div className="mb-1.5 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                    1. Contract Type
-                  </div>
-                  <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-5">
-                    {(
-                      [
-                        { id: 'CALL', label: 'Rise' },
-                        { id: 'PUT', label: 'Fall' },
-                        { id: 'DIGITEVEN', label: 'Even' },
-                        { id: 'DIGITODD', label: 'Odd' },
-                        { id: 'DIGITDIFF', label: `Diff ${tradeDigit}` },
-                      ] as const
-                    ).map((opt) => (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => setTradeType(opt.id)}
-                        className={`rounded-md py-1.5 text-xs font-semibold transition ${
-                          tradeType === opt.id
-                            ? opt.id === 'PUT'
-                              ? 'bg-[#FF4D5A] text-white'
-                              : 'bg-[#00A88F] text-white'
-                            : 'border border-[#E5E9EF] bg-[#F5F7FA] text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
-                        }`}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
+              ) : drawdownLocked ? (
+                <div className="flex items-center justify-between gap-2 rounded-md border border-[#FF444F] bg-[#FF444F]/10 px-3 py-2.5 text-xs text-[#FF444F]">
+                  <span className="flex items-center gap-1.5 font-bold">
+                    <Lock className="h-4 w-4" />
+                    $10.00 Drawdown Stop Active
+                  </span>
+                  <button
+                    type="button"
+                    onClick={resetSessionProgress}
+                    className="rounded bg-[#FF444F] px-2.5 py-1 font-bold text-white"
+                  >
+                    Reset Session
+                  </button>
                 </div>
-
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <div className="mb-1 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                      2. Stake ({derivSession.activeCurrency})
-                    </div>
-                    <div className="flex flex-wrap gap-1">
-                      {STAKE_PRESETS.map((amt) => (
-                        <button
-                          key={amt}
-                          type="button"
-                          onClick={() => setTradeStake(amt)}
-                          className={`rounded px-2.5 py-1 font-mono text-xs font-semibold tabular-nums ${
-                            tradeStake === amt
-                              ? 'bg-[#101820] text-white dark:bg-[#0866FF]'
-                              : 'border border-[#E5E9EF] bg-[#F5F7FA] text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
-                          }`}
-                        >
-                          ${amt}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="mb-1 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                      3. Duration
-                    </div>
-                    <div className="flex gap-1.5">
-                      <input
-                        type="number"
-                        min={1}
-                        max={isDigitSelected ? 10 : 300}
-                        value={isDigitSelected ? Math.min(10, tradeDuration) : tradeDuration}
-                        onChange={(e) => setTradeDuration(Math.max(1, Number(e.target.value)))}
-                        className="w-16 rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 font-mono text-xs tabular-nums text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
-                      />
-                      {!isDigitSelected ? (
-                        <select
-                          value={tradeUnit}
-                          onChange={(e) => setTradeUnit(e.target.value as 't' | 's')}
-                          className="flex-1 rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 text-xs text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
-                        >
-                          <option value="t">Ticks</option>
-                          <option value="s">Seconds</option>
-                        </select>
-                      ) : (
-                        <span className="self-center text-xs text-[#6B7280]">Ticks</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Live Deriv Payout Quote Preview */}
-                {liveProposal && (
-                  <div className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 font-mono text-xs tabular-nums dark:bg-[#0F151D]">
-                    <span className="text-[#6B7280] dark:text-[#9CA3AF]">
-                      Payout: <strong className="text-[#20242B] dark:text-white">${liveProposal.payout.toFixed(2)}</strong>
-                    </span>
-                    <span className="text-[#6B7280] dark:text-[#9CA3AF]">
-                      Return:{' '}
-                      <strong className="text-[#00A88F]">
-                        +${(liveProposal.payout - liveProposal.askPrice).toFixed(2)} (
-                        {(((liveProposal.payout - liveProposal.askPrice) / liveProposal.askPrice) * 100).toFixed(1)}%)
-                      </strong>
-                    </span>
-                  </div>
-                )}
-
-                {!derivSession.activeIsVirtual && (
-                  <label className="flex items-center gap-2 rounded border border-[#FF444F]/40 bg-[#FF444F]/10 px-3 py-2 text-xs text-[#FF444F]">
-                    <input
-                      type="checkbox"
-                      checked={realTradeConfirm}
-                      onChange={(e) => setRealTradeConfirm(e.target.checked)}
-                      className="h-4 w-4 accent-[#FF444F]"
-                    />
-                    <span>Confirm live trade using REAL balance ({derivSession.activeLoginId})</span>
-                  </label>
-                )}
-
+              ) : (
                 <button
                   type="button"
-                  disabled={tradeBusy}
-                  onClick={handlePlaceDerivTrade}
-                  className={`flex w-full items-center justify-center gap-1.5 rounded-md px-4 py-2.5 text-xs font-bold text-white disabled:opacity-50 ${
+                  disabled={tradeBusy || !lockedSignal}
+                  onClick={() => lockedSignal && void executeTradeSignal(lockedSignal)}
+                  className={`flex w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-xs font-bold text-white disabled:opacity-50 ${
                     derivSession.activeIsVirtual
                       ? 'bg-[#00A88F] hover:bg-[#00917b]'
                       : 'bg-[#FF444F] hover:bg-[#e53843]'
@@ -901,116 +1314,63 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 >
                   <Play className="h-3.5 w-3.5" />
                   {tradeBusy
-                    ? 'Sending Order to Deriv…'
-                    : `Place ${tradeType} on ${derivSession.activeIsVirtual ? 'Demo' : 'REAL'} ($${tradeStake})`}
+                    ? 'Placing Trade…'
+                    : `Place ${activeContractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit ${activeDigit} · $${effectiveNextStake.toFixed(2)}`}
                 </button>
+              )}
+            </div>
 
-                {tradeMsg && (
-                  <div className="rounded-md bg-[#F5F7FA] px-3 py-2 text-xs text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]">
-                    {tradeMsg}
-                  </div>
+            {statusMessage && (
+              <div className="mt-2.5 flex items-start gap-2 rounded bg-[#F5F7FA] px-3 py-2 text-xs text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]">
+                {statusMessage.includes('Loss') || statusMessage.includes('Stopped') ? (
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#FFAD3A]" />
+                ) : (
+                  <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#00A88F]" />
                 )}
+                <span>{statusMessage}</span>
+              </div>
+            )}
 
-                {/* Real-Time Open & Settled Contracts (proposal_open_contract live P&L) */}
-                {liveContracts.length > 0 && (
-                  <div className="space-y-1.5 border-t border-[#E5E9EF] pt-2.5 dark:border-[#243040]">
-                    <div className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                      Real-Time Contract Calculations (Updates Every Tick)
-                    </div>
-                    {liveContracts.slice(0, 5).map((c) => (
-                      <div
-                        key={c.contractId}
-                        className="rounded bg-[#F5F7FA] px-3 py-2 text-xs dark:bg-[#0F151D]"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-semibold text-[#20242B] dark:text-[#F3F4F6]">
-                            {c.contractType} · {c.symbol} · ${c.buyPrice.toFixed(2)}
-                          </span>
-                          <span
-                            className={`font-mono font-bold tabular-nums ${
-                              c.profit >= 0 ? 'text-[#00A88F]' : 'text-[#FF4D5A]'
-                            }`}
-                          >
-                            {c.profit >= 0 ? '+' : ''}
-                            {c.profit.toFixed(2)} {c.currency} ({c.profitPct >= 0 ? '+' : ''}
-                            {c.profitPct.toFixed(1)}%)
-                          </span>
+            {/* Live Bot Trades Ledger */}
+            {sessionTrades.length > 0 && (
+              <div className="mt-3 space-y-1.5 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
+                <div className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                  Session Trades
+                </div>
+                <div className="max-h-44 space-y-1.5 overflow-y-auto">
+                  {sessionTrades.slice(0, 8).map((tr) => (
+                    <div
+                      key={tr.contractId}
+                      className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 text-xs dark:bg-[#0F151D]"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-semibold text-[#20242B] dark:text-white">
+                          {tr.contractType === 'DIGITMATCH' ? 'Match' : 'Differ'} {tr.digit} · {tr.symbol}
                         </div>
-                        <div className="mt-1 flex items-center justify-between text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                          <span className="font-mono tabular-nums">
-                            Entry: {c.entrySpot ?? '—'} → Now: {c.currentSpot ?? '—'}
-                          </span>
-                          {c.status === 'open' && !c.isSold ? (
-                            <button
-                              type="button"
-                              onClick={() => void handleSellEarly(c.contractId)}
-                              className="rounded bg-[#0866FF] px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-[#0654d4]"
-                            >
-                              Sell (${c.bidPrice.toFixed(2)})
-                            </button>
-                          ) : (
-                            <span className="font-mono uppercase">{c.status}</span>
-                          )}
+                        <div className="font-mono text-[10px] tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
+                          Stake ${tr.stake.toFixed(2)} · Spot {tr.entrySpot ?? '—'} → {tr.exitSpot ?? '—'}
                         </div>
                       </div>
-                    ))}
-                  </div>
-                )}
+                      <span
+                        className={`font-mono font-bold tabular-nums ${
+                          tr.status === 'open'
+                            ? 'text-[#0866FF]'
+                            : tr.profit >= 0
+                            ? 'text-[#00A88F]'
+                            : 'text-[#FF4D5A]'
+                        }`}
+                      >
+                        {tr.status === 'open'
+                          ? 'LIVE…'
+                          : `${tr.profit >= 0 ? '+' : ''}$${tr.profit.toFixed(2)}`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>
         </div>
-      </div>
-
-      {/* Bottom Pro Navigation Strip */}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <button
-          type="button"
-          onClick={() => onJumpToTab('terminal')}
-          className="flex items-center gap-3 rounded-lg border border-[#E5E9EF] bg-white p-3.5 text-left hover:border-[#0866FF] dark:border-[#243040] dark:bg-[#151D27]"
-        >
-          <BarChart3 className="h-5 w-5 shrink-0 text-[#0866FF]" />
-          <div>
-            <div className="text-xs font-bold text-[#20242B] dark:text-white">Live Chart Terminal</div>
-            <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Candlesticks &amp; order ticket</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => onJumpToTab('digits')}
-          className="flex items-center gap-3 rounded-lg border border-[#E5E9EF] bg-white p-3.5 text-left hover:border-[#0866FF] dark:border-[#243040] dark:bg-[#151D27]"
-        >
-          <Hash className="h-5 w-5 shrink-0 text-[#00A88F]" />
-          <div>
-            <div className="text-xs font-bold text-[#20242B] dark:text-white">Digits Studio Pro</div>
-            <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Match/Differ EV &amp; confidence bounds</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => onJumpToTab('scanner')}
-          className="flex items-center gap-3 rounded-lg border border-[#E5E9EF] bg-white p-3.5 text-left hover:border-[#0866FF] dark:border-[#243040] dark:bg-[#151D27]"
-        >
-          <Radar className="h-5 w-5 shrink-0 text-[#08B9E6]" />
-          <div>
-            <div className="text-xs font-bold text-[#20242B] dark:text-white">All-Market Scanner</div>
-            <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Scan top markets &amp; backtest</div>
-          </div>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => onJumpToTab('strategy')}
-          className="flex items-center gap-3 rounded-lg border border-[#E5E9EF] bg-white p-3.5 text-left hover:border-[#0866FF] dark:border-[#243040] dark:bg-[#151D27]"
-        >
-          <Compass className="h-5 w-5 shrink-0 text-[#FF444F]" />
-          <div>
-            <div className="text-xs font-bold text-[#20242B] dark:text-white">Bot Block Builder</div>
-            <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Visual blocks, XML &amp; scheduler</div>
-          </div>
-        </button>
       </div>
     </div>
   );

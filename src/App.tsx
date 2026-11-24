@@ -1,16 +1,9 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity,
-  AlertOctagon,
   BarChart3,
-  Blocks,
-  Bot,
-  CandlestickChart,
   ExternalLink,
-  Hash,
   Moon,
-  Radar,
-  ShieldCheck,
   Sun,
   X,
 } from 'lucide-react';
@@ -26,22 +19,15 @@ import type {
 import { AnalyserBotWorkspace } from './components/AnalyserBotWorkspace';
 import { TerminalWorkspace } from './components/TerminalWorkspace';
 import { DigitsStudio } from './components/DigitsStudio';
-import { QuantScannerWorkspace } from './components/QuantScannerWorkspace';
-import { StrategyBuilderWorkspace } from './components/StrategyBuilderWorkspace';
 import { RiskAccountsWorkspace } from './components/RiskAccountsWorkspace';
 
-const TABS: Array<{
-  id: DqiTab;
-  label: string;
-  shortDesc: string;
-  icon: React.FC<{ className?: string }>;
-}> = [
-  { id: 'analyser', label: 'AI Analyser', shortDesc: 'Beginner signal & AI brief', icon: Bot },
-  { id: 'terminal', label: 'Terminal', shortDesc: 'Live chart & order ticket', icon: CandlestickChart },
-  { id: 'digits', label: 'Digits Studio', shortDesc: 'Last-digit & Match/Differ', icon: Hash },
-  { id: 'scanner', label: 'Quant Scanner', shortDesc: 'Indicators, scan & backtest', icon: Radar },
-  { id: 'strategy', label: 'Strategy & Bots', shortDesc: 'Bot blocks, XML & scheduler', icon: Blocks },
-  { id: 'risk', label: 'Risk & Accounts', shortDesc: 'Demo/Real switch, OAuth & DB', icon: ShieldCheck },
+const PARTNER_REF_CODE = '352P3WGh6Jm4clLrnbq6u';
+
+const NAV_TABS: Array<{ id: DqiTab; label: string }> = [
+  { id: 'analyser', label: 'Bot & Scanner' },
+  { id: 'digits', label: 'Digits' },
+  { id: 'terminal', label: 'Live Chart' },
+  { id: 'risk', label: 'Accounts' },
 ];
 
 export default function App() {
@@ -50,7 +36,13 @@ export default function App() {
 
   const [symbols, setSymbols] = useState<ActiveSymbol[]>([]);
   const [symbolsError, setSymbolsError] = useState<string | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState<string>('1HZ100V');
+  const [selectedSymbol, setSelectedSymbol] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem('dqi_selected_symbol') || '1HZ15V';
+    } catch {
+      return '1HZ15V';
+    }
+  });
 
   const [latestTick, setLatestTick] = useState<LiveTickEvent | null>(null);
   const [liveTapeBuffer, setLiveTapeBuffer] = useState<LiveTickEvent[]>([]);
@@ -67,20 +59,26 @@ export default function App() {
   const [paperAccount, setPaperAccount] = useState<PaperAccount | null>(null);
   const [derivSession, setDerivSession] = useState<DerivSessionState>(() => dqiApi.getDerivSession());
   const [liveContracts, setLiveContracts] = useState<LiveDerivContract[]>([]);
-  const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [globalNotice, setGlobalNotice] = useState<string | null>(null);
 
-  // Quick Deriv Connect Modal
+  // Connect Deriv Modal
   const [connectOpen, setConnectOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState('');
   const [appIdInput, setAppIdInput] = useState(() => dqiApi.getDerivSession().appId || '1089');
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectErr, setConnectErr] = useState<string | null>(null);
 
-  // Sync dark mode class on <html>
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('dqi_selected_symbol', selectedSymbol);
+    } catch {
+      // ignore storage errors
+    }
+  }, [selectedSymbol]);
 
   // Subscribe to real-time Deriv Session (Demo + Real balances) & live contracts
   useEffect(() => {
@@ -92,18 +90,18 @@ export default function App() {
     };
   }, []);
 
-  // Load server App ID + parse Deriv OAuth callback tokens (?acct1=...&token1=...&cur1=...)
+  // Automatic Deriv OAuth callback parser + system App ID loader
   useEffect(() => {
     void (async () => {
       try {
         const st = await dqiApi.getSystemStatus();
         if (st?.derivWsUrl) dqiApi.setDerivWsBaseUrl(st.derivWsUrl);
-        if (st?.derivAppId) {
+        if (st?.derivAppId && /^\d+$/.test(st.derivAppId)) {
           dqiApi.setDerivAppId(st.derivAppId);
           setAppIdInput(st.derivAppId);
         }
       } catch {
-        // fallback to default app id 1089
+        // default 1089
       }
 
       const params = new URLSearchParams(window.location.search);
@@ -118,12 +116,11 @@ export default function App() {
       }
 
       if (oauthAccounts.length > 0) {
-        // Immediately scrub tokens from address bar
         window.history.replaceState({}, '', window.location.pathname);
         try {
           const s = await dqiApi.authorizeDerivOAuthAccounts(oauthAccounts);
           setGlobalNotice(
-            `Connected Deriv (${oauthAccounts.length} account(s) loaded). Active: ${s.activeIsVirtual ? 'DEMO' : 'REAL'} ${s.activeLoginId}.`
+            `Connected ${oauthAccounts.length} Deriv account(s). Active: ${s.activeIsVirtual ? 'DEMO' : 'REAL'} (${s.activeLoginId}).`
           );
         } catch (err) {
           setGlobalNotice(err instanceof Error ? err.message : 'Deriv OAuth authorization failed');
@@ -135,57 +132,37 @@ export default function App() {
       const oauthErr = params.get('oauth_error');
       if (oauthState === 'connected') {
         setGlobalNotice('Deriv account connected.');
-        setActiveTab('risk');
         window.history.replaceState({}, '', window.location.pathname);
       } else if (oauthErr) {
         setGlobalNotice(`Deriv OAuth notice: ${oauthErr}`);
-        setActiveTab('risk');
         window.history.replaceState({}, '', window.location.pathname);
       }
     })();
   }, []);
 
-  const loadSymbols = useCallback(
-    async (refresh = false) => {
-      setSymbolsError(null);
-      try {
-        const res = await dqiApi.getSymbols(refresh);
-        const list = res.symbols || [];
-        setSymbols(list);
-        if (list.length > 0 && !list.some((s) => s.symbol === selectedSymbol)) {
-          const preferred =
-            list.find((s) => s.symbol === '1HZ100V') ||
-            list.find((s) => s.symbol === 'R_100') ||
-            list[0];
-          if (preferred) setSelectedSymbol(preferred.symbol);
-        }
-      } catch (err) {
-        setSymbolsError(err instanceof Error ? err.message : 'Unable to load Deriv active symbols');
-      }
-    },
-    [selectedSymbol]
-  );
+  const loadSymbols = useCallback(async (refresh = false) => {
+    setSymbolsError(null);
+    try {
+      const res = await dqiApi.getSymbols(refresh);
+      const list = res.symbols || [];
+      setSymbols(list);
+    } catch (err) {
+      setSymbolsError(err instanceof Error ? err.message : 'Unable to load Deriv active symbols');
+    }
+  }, []);
 
   const refreshSystemState = useCallback(async () => {
     try {
-      const [acct, live] = await Promise.all([
-        dqiApi.getPaperAccount(),
-        dqiApi.getLiveControl(),
-      ]);
+      const acct = await dqiApi.getPaperAccount();
       setPaperAccount(acct);
-      setKillSwitchActive(Boolean(live.control?.kill_switch));
     } catch {
-      // non-fatal background sync
+      // non-fatal
     }
   }, []);
 
   useEffect(() => {
     void loadSymbols(false);
     void refreshSystemState();
-    const timer = window.setInterval(() => {
-      void refreshSystemState();
-    }, 15000);
-    return () => window.clearInterval(timer);
   }, [loadSymbols, refreshSystemState]);
 
   // Direct Real-Time Deriv Browser WebSocket tick stream
@@ -226,31 +203,14 @@ export default function App() {
     return () => unsubscribe();
   }, [selectedSymbol]);
 
-  const handleQuickKillSwitch = async () => {
-    try {
-      if (killSwitchActive) {
-        await dqiApi.resetKillSwitch();
-        setKillSwitchActive(false);
-        setGlobalNotice('Kill switch reset to READY.');
-      } else {
-        await dqiApi.activateKillSwitch();
-        setKillSwitchActive(true);
-        setGlobalNotice('Emergency Kill Switch activated.');
-      }
-    } catch (err) {
-      setGlobalNotice(err instanceof Error ? err.message : 'Kill switch update failed');
-    }
-  };
-
   const handleOAuthLogin = async () => {
     setConnectBusy(true);
     setConnectErr(null);
     try {
       const cleanId = appIdInput.trim();
-      if (/^\d+$/.test(cleanId)) {
-        dqiApi.setDerivAppId(cleanId, true);
-      }
-      const res = await dqiApi.startDerivOAuth(cleanId);
+      const numericId = /^\d+$/.test(cleanId) ? cleanId : '1089';
+      dqiApi.setDerivAppId(numericId, true);
+      const res = await dqiApi.startDerivOAuth(numericId);
       window.location.assign(res.authorizationUrl);
     } catch (err) {
       setConnectErr(err instanceof Error ? err.message : 'Could not start Deriv OAuth');
@@ -260,7 +220,8 @@ export default function App() {
 
   const handleTokenLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!tokenInput.trim()) return;
+    const raw = tokenInput.trim();
+    if (!raw) return;
     setConnectBusy(true);
     setConnectErr(null);
     try {
@@ -268,7 +229,29 @@ export default function App() {
       if (/^\d+$/.test(cleanId)) {
         dqiApi.setDerivAppId(cleanId, true);
       }
-      const s = await dqiApi.authorizeDerivToken(tokenInput.trim());
+
+      // Support pasting full OAuth redirect URL (?acct1=...&token1=...)
+      if (raw.includes('acct1=') && raw.includes('token1=')) {
+        const queryPart = raw.includes('?') ? raw.split('?')[1] : raw;
+        const p = new URLSearchParams(queryPart);
+        const entries: Array<{ loginid: string; token: string; currency?: string }> = [];
+        for (let i = 1; i <= 10; i += 1) {
+          const acct = p.get(`acct${i}`);
+          const tok = p.get(`token${i}`);
+          const cur = p.get(`cur${i}`) ?? undefined;
+          if (acct && tok) entries.push({ loginid: acct, token: tok, currency: cur });
+        }
+        if (entries.length === 0) throw new Error('Could not find account tokens in pasted URL.');
+        const s = await dqiApi.authorizeDerivOAuthAccounts(entries);
+        setTokenInput('');
+        setConnectOpen(false);
+        setGlobalNotice(
+          `Connected ${entries.length} Deriv account(s). Active: ${s.activeIsVirtual ? 'DEMO' : 'REAL'} (${s.activeLoginId}).`
+        );
+        return;
+      }
+
+      const s = await dqiApi.authorizeDerivToken(raw);
       setTokenInput('');
       setConnectOpen(false);
       setGlobalNotice(
@@ -281,12 +264,14 @@ export default function App() {
     }
   };
 
-  const handleAccountSelectChange = async (loginid: string) => {
+  const handleSwitchAccount = async (loginid: string) => {
     const target = derivSession.accounts.find((a) => a.loginid === loginid);
     if (!target) return;
     if (!target.hasToken) {
-      setActiveTab('risk');
-      setGlobalNotice(`Attach an API Token for ${loginid} in Risk & Accounts (or use Deriv OAuth) to switch.`);
+      setConnectOpen(true);
+      setConnectErr(
+        `Enter an API token for ${loginid} (or sign in with Deriv OAuth) so both Demo and Real accounts can switch in 1 tap.`
+      );
       return;
     }
     try {
@@ -299,319 +284,197 @@ export default function App() {
     }
   };
 
-  const activeSymbolMeta = symbols.find((s) => s.symbol === selectedSymbol);
+  // Pick primary Demo (VRTC) and primary Real (CR/MF/etc.) accounts for the top bar
+  const demoAccount = useMemo(
+    () => derivSession.accounts.find((a) => a.isVirtual) || null,
+    [derivSession.accounts]
+  );
+  const realAccount = useMemo(
+    () => derivSession.accounts.find((a) => !a.isVirtual) || null,
+    [derivSession.accounts]
+  );
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] text-[#20242B] antialiased dark:bg-[#0D131A] dark:text-[#F3F4F6]">
-      <div className="flex min-h-screen">
-        {/* Desktop Sidebar (#101820 Official Deriv Dark Navy) */}
-        <aside className="hidden w-60 shrink-0 flex-col justify-between bg-[#101820] text-white lg:flex">
-          <div>
-            <div className="flex items-center gap-2.5 border-b border-white/10 px-4 py-4">
-              <div className="flex h-8 w-8 items-center justify-center rounded-md bg-[#FF444F] text-white">
-                <BarChart3 className="h-4 w-4" />
-              </div>
-              <div className="min-w-0">
-                <div className="truncate text-sm font-bold tracking-tight text-white">
-                  Deriv Quant
-                </div>
-                <div className="truncate text-[11px] text-[#9CA3AF]">
-                  AI Analyser Terminal
-                </div>
-              </div>
+      {/* Clean 3-Zone Top Bar */}
+      <header className="sticky top-0 z-30 border-b border-[#E5E9EF] bg-white px-4 py-2.5 dark:border-[#243040] dark:bg-[#151D27]">
+        <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-4">
+          {/* Zone 1: Brand Wordmark */}
+          <div className="flex items-center gap-3 shrink-0">
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-[#FF444F] text-white">
+              <BarChart3 className="h-4 w-4" />
             </div>
-
-            <nav className="space-y-1 px-2.5 py-4" aria-label="Primary sections">
-              {TABS.map((tab) => {
-                const Icon = tab.icon;
-                const active = activeTab === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setActiveTab(tab.id)}
-                    className={`flex w-full items-start gap-3 rounded-md px-3 py-2.5 text-left transition ${
-                      active
-                        ? 'bg-[#0866FF] text-white'
-                        : 'text-[#D1D5DB] hover:bg-white/8 hover:text-white'
-                    }`}
-                  >
-                    <Icon className="mt-0.5 h-4 w-4 shrink-0" />
-                    <div className="min-w-0">
-                      <div className="text-xs font-semibold">{tab.label}</div>
-                      <div className={`truncate text-[11px] ${active ? 'text-white/80' : 'text-[#9CA3AF]'}`}>
-                        {tab.shortDesc}
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </nav>
+            <span className="whitespace-nowrap text-sm font-bold tracking-tight text-[#20242B] dark:text-white">
+              Deriv Quant
+            </span>
           </div>
 
-          {/* Live Deriv Account Balance Panel in Sidebar */}
-          <div className="space-y-2.5 border-t border-white/10 p-4 text-xs">
-            <div className="rounded-md bg-white/5 p-3">
-              {derivSession.connected ? (
-                <>
-                  <div className="flex items-center justify-between">
-                    <span
-                      className={`font-mono text-[11px] font-bold ${
-                        derivSession.activeIsVirtual ? 'text-[#00A88F]' : 'text-[#FF444F]'
-                      }`}
-                    >
-                      {derivSession.activeIsVirtual ? 'DERIV DEMO' : 'DERIV REAL'}
-                    </span>
-                    <span className="font-mono text-[11px] text-[#9CA3AF]">
-                      {derivSession.activeLoginId}
-                    </span>
-                  </div>
-                  <div className="mt-1 font-mono text-base font-bold tabular-nums text-white">
-                    {derivSession.activeBalance !== null
-                      ? `${derivSession.activeBalance.toFixed(2)} ${derivSession.activeCurrency}`
-                      : 'Loading…'}
-                  </div>
-                  {derivSession.accounts.length > 1 && (
-                    <select
-                      aria-label="Switch Deriv Demo or Real account"
-                      value={derivSession.activeLoginId || ''}
-                      onChange={(e) => void handleAccountSelectChange(e.target.value)}
-                      className="mt-2 w-full rounded bg-[#1A2430] px-2 py-1 text-[11px] text-white outline-none"
-                    >
-                      {derivSession.accounts.map((a) => (
-                        <option key={a.loginid} value={a.loginid}>
-                          {a.isVirtual ? 'DEMO' : 'REAL'} · {a.loginid} (
-                          {a.balance !== null ? `${a.balance.toFixed(2)} ${a.currency}` : a.currency})
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </>
-              ) : (
-                <>
-                  <div className="text-[11px] text-[#9CA3AF]">Deriv Account</div>
-                  <div className="mt-0.5 text-xs font-semibold text-white">Not Connected</div>
-                  <button
-                    type="button"
-                    onClick={() => setConnectOpen(true)}
-                    className="mt-2 w-full rounded bg-[#0866FF] px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-[#0654d4]"
-                  >
-                    Connect Demo / Real
-                  </button>
-                </>
-              )}
-            </div>
-
-            <button
-              type="button"
-              onClick={handleQuickKillSwitch}
-              className={`flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs font-semibold transition ${
-                killSwitchActive
-                  ? 'bg-[#00A88F] text-white hover:bg-[#00917b]'
-                  : 'bg-[#FF444F] text-white hover:bg-[#e53843]'
-              }`}
-            >
-              <AlertOctagon className="h-3.5 w-3.5" />
-              {killSwitchActive ? 'Reset Kill Switch' : 'Emergency Kill Switch'}
-            </button>
-          </div>
-        </aside>
-
-        {/* Main Content Column */}
-        <div className="flex min-w-0 flex-1 flex-col">
-          {/* Clean 3-Zone Top Header */}
-          <header className="sticky top-0 z-20 border-b border-[#E5E9EF] bg-white px-4 py-2.5 dark:border-[#243040] dark:bg-[#151D27]">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              {/* Zone 1: Brand / Active Symbol */}
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 lg:hidden">
-                  <div className="flex h-7 w-7 items-center justify-center rounded bg-[#FF444F] text-white">
-                    <BarChart3 className="h-4 w-4" />
-                  </div>
-                  <span className="whitespace-nowrap text-sm font-bold text-[#20242B] dark:text-white">
-                    Deriv Quant Intelligence
-                  </span>
-                </div>
-
-                <div className="hidden items-center gap-3 sm:flex">
-                  <div>
-                    <div className="text-xs font-bold text-[#20242B] dark:text-white">
-                      {activeSymbolMeta?.display_name || selectedSymbol}
-                    </div>
-                    <div className="font-mono text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                      {selectedSymbol} · {activeSymbolMeta?.market_display_name || 'Deriv Feed'}
-                    </div>
-                  </div>
-                  <div className="h-6 w-px bg-[#E5E9EF] dark:bg-[#243040]" />
-                  <div>
-                    <div className="text-[10px] uppercase tracking-wide text-[#6B7280] dark:text-[#9CA3AF]">
-                      Spot Price
-                    </div>
-                    <div className="font-mono text-sm font-bold tabular-nums text-[#20242B] dark:text-white">
-                      {latestTick ? latestTick.rawQuote : '—'}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] uppercase tracking-wide text-[#6B7280] dark:text-[#9CA3AF]">
-                      Last Digit
-                    </div>
-                    <div className="font-mono text-sm font-bold tabular-nums text-[#0866FF]">
-                      {latestTick ? latestTick.lastDigit : '—'}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Zone 2: Horizontal Navigation (mobile/tablet) */}
-              <div className="flex items-center gap-1 overflow-x-auto lg:hidden">
-                {TABS.map((tab) => (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setActiveTab(tab.id)}
-                    className={`shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-semibold ${
-                      activeTab === tab.id
-                        ? 'bg-[#0866FF] text-white'
-                        : 'text-[#6B7280] hover:bg-[#F5F7FA] dark:text-[#9CA3AF] dark:hover:bg-[#0F151D]'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-
-              {/* Zone 3: Feed Status + Theme Toggle + Deriv Account / Connect */}
-              <div className="flex items-center gap-2">
-                <div className="flex items-center gap-1.5 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-2.5 py-1 text-xs dark:border-[#243040] dark:bg-[#0F151D]">
-                  <Activity
-                    className={`h-3.5 w-3.5 ${
-                      feedHealth.state === 'LIVE' && !feedHealth.isStale
-                        ? 'text-[#00A88F]'
-                        : 'text-[#FFAD3A]'
-                    }`}
-                  />
-                  <span className="font-mono text-[11px] font-semibold">
-                    {feedHealth.state}
-                  </span>
-                </div>
-
+          {/* Zone 2: 4 Clean Single-Line Nav Tabs */}
+          <nav className="flex items-center gap-1 overflow-x-auto" aria-label="Workspace navigation">
+            {NAV_TABS.map((tab) => {
+              const active = activeTab === tab.id;
+              return (
                 <button
+                  key={tab.id}
                   type="button"
-                  onClick={() => setDarkMode((v) => !v)}
-                  aria-label="Toggle color theme"
-                  className="rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-1.5 text-[#20242B] hover:bg-[#EAEFF5] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]"
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`whitespace-nowrap shrink-0 rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+                    active
+                      ? 'bg-[#0866FF] text-white'
+                      : 'text-[#6B7280] hover:bg-[#F5F7FA] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:bg-[#0F151D] dark:hover:text-white'
+                  }`}
                 >
-                  {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+                  {tab.label}
                 </button>
+              );
+            })}
+          </nav>
 
-                {derivSession.connected ? (
+          {/* Zone 3: Live Feed + Demo & Real Balances + Connect / Theme */}
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="hidden items-center gap-1.5 px-2 py-1 text-xs text-[#6B7280] dark:text-[#9CA3AF] sm:flex">
+              <Activity
+                className={`h-3.5 w-3.5 ${
+                  feedHealth.state === 'LIVE' && !feedHealth.isStale
+                    ? 'text-[#00A88F]'
+                    : 'text-[#FFAD3A]'
+                }`}
+              />
+              <span className="font-mono text-[11px] font-semibold">{feedHealth.state}</span>
+            </div>
+
+            {derivSession.connected ? (
+              <div className="flex items-center gap-1 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-1 dark:border-[#243040] dark:bg-[#0F151D]">
+                {demoAccount && (
                   <button
                     type="button"
-                    onClick={() => setActiveTab('risk')}
-                    className={`whitespace-nowrap rounded-md px-3 py-1.5 font-mono text-xs font-bold tabular-nums text-white ${
+                    onClick={() => void handleSwitchAccount(demoAccount.loginid)}
+                    title={`Demo Account (${demoAccount.loginid})`}
+                    className={`whitespace-nowrap shrink-0 rounded px-2.5 py-1 font-mono text-xs font-bold tabular-nums transition ${
                       derivSession.activeIsVirtual
-                        ? 'bg-[#00A88F] hover:bg-[#00917b]'
-                        : 'bg-[#FF444F] hover:bg-[#e53843]'
+                        ? 'bg-[#00A88F] text-white'
+                        : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
                     }`}
                   >
-                    {derivSession.activeIsVirtual ? 'DEMO' : 'REAL'} ·{' '}
-                    {derivSession.activeBalance !== null
-                      ? `$${derivSession.activeBalance.toFixed(2)}`
-                      : derivSession.activeLoginId}
+                    Demo{' '}
+                    {demoAccount.balance !== null
+                      ? `$${demoAccount.balance.toFixed(2)}`
+                      : demoAccount.loginid}
+                  </button>
+                )}
+
+                {realAccount ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleSwitchAccount(realAccount.loginid)}
+                    title={`Real Account (${realAccount.loginid})`}
+                    className={`whitespace-nowrap shrink-0 rounded px-2.5 py-1 font-mono text-xs font-bold tabular-nums transition ${
+                      !derivSession.activeIsVirtual
+                        ? 'bg-[#FF444F] text-white'
+                        : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
+                    }`}
+                  >
+                    Real{' '}
+                    {realAccount.balance !== null
+                      ? `$${realAccount.balance.toFixed(2)}`
+                      : realAccount.loginid}
                   </button>
                 ) : (
                   <button
                     type="button"
                     onClick={() => setConnectOpen(true)}
-                    className="whitespace-nowrap rounded-md bg-[#0866FF] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#0654d4]"
+                    className="whitespace-nowrap shrink-0 rounded px-2.5 py-1 text-xs font-semibold text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white"
                   >
-                    Connect Deriv
+                    + Link Real
                   </button>
                 )}
               </div>
-            </div>
-          </header>
-
-          {globalNotice && (
-            <div className="mx-4 mt-3 flex items-center justify-between gap-3 rounded-md border border-[#0866FF]/30 bg-[#0866FF]/10 px-4 py-2 text-xs text-[#20242B] dark:text-[#F3F4F6]">
-              <span>{globalNotice}</span>
-              <button type="button" onClick={() => setGlobalNotice(null)} className="font-semibold underline">
-                Dismiss
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConnectOpen(true)}
+                className="whitespace-nowrap shrink-0 rounded-md bg-[#0866FF] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#0654d4]"
+              >
+                Connect Deriv
               </button>
-            </div>
-          )}
-
-          {/* Active Workspace Canvas */}
-          <main className="flex-1 p-4">
-            {activeTab === 'analyser' && (
-              <AnalyserBotWorkspace
-                symbols={symbols}
-                selectedSymbol={selectedSymbol}
-                onSelectSymbol={setSelectedSymbol}
-                latestTick={latestTick}
-                liveTapeBuffer={liveTapeBuffer}
-                derivSession={derivSession}
-                liveContracts={liveContracts}
-                onOpenConnect={() => setConnectOpen(true)}
-                onJumpToTab={setActiveTab}
-              />
             )}
 
-            {activeTab === 'terminal' && (
-              <TerminalWorkspace
-                symbols={symbols}
-                symbolsError={symbolsError}
-                selectedSymbol={selectedSymbol}
-                onSelectSymbol={setSelectedSymbol}
-                latestTick={latestTick}
-                feedHealth={feedHealth}
-                onOpenDigits={() => setActiveTab('digits')}
-                onRefreshSymbols={() => void loadSymbols(true)}
-                onOpenConnect={() => setConnectOpen(true)}
-              />
-            )}
-
-            {activeTab === 'digits' && (
-              <DigitsStudio
-                symbols={symbols}
-                selectedSymbol={selectedSymbol}
-                onSelectSymbol={setSelectedSymbol}
-                latestTick={latestTick}
-                liveTapeBuffer={liveTapeBuffer}
-              />
-            )}
-
-            {activeTab === 'scanner' && (
-              <QuantScannerWorkspace
-                symbols={symbols}
-                selectedSymbol={selectedSymbol}
-                onSelectSymbol={setSelectedSymbol}
-                onJumpToTerminal={() => setActiveTab('terminal')}
-              />
-            )}
-
-            {activeTab === 'strategy' && (
-              <StrategyBuilderWorkspace symbols={symbols} selectedSymbol={selectedSymbol} />
-            )}
-
-            {activeTab === 'risk' && (
-              <RiskAccountsWorkspace
-                paperAccount={paperAccount}
-                derivSession={derivSession}
-                onRefreshSystem={() => void refreshSystemState()}
-              />
-            )}
-          </main>
+            <button
+              type="button"
+              onClick={() => setDarkMode((v) => !v)}
+              aria-label="Toggle color theme"
+              className="rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-1.5 text-[#20242B] hover:bg-[#EAEFF5] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]"
+            >
+              {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            </button>
+          </div>
         </div>
-      </div>
+      </header>
 
-      {/* Quick Connect Deriv Modal (OAuth + Instant API Token) */}
+      {globalNotice && (
+        <div className="mx-auto mt-3 flex max-w-7xl items-center justify-between gap-3 rounded-md border border-[#0866FF]/30 bg-[#0866FF]/10 px-4 py-2 text-xs text-[#20242B] dark:text-[#F3F4F6]">
+          <span>{globalNotice}</span>
+          <button type="button" onClick={() => setGlobalNotice(null)} className="font-semibold underline">
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Main Content */}
+      <main className="mx-auto max-w-7xl p-4">
+        {activeTab === 'analyser' && (
+          <AnalyserBotWorkspace
+            symbols={symbols}
+            selectedSymbol={selectedSymbol}
+            onSelectSymbol={setSelectedSymbol}
+            latestTick={latestTick}
+            liveTapeBuffer={liveTapeBuffer}
+            derivSession={derivSession}
+            liveContracts={liveContracts}
+            onOpenConnect={() => setConnectOpen(true)}
+          />
+        )}
+
+        {activeTab === 'digits' && (
+          <DigitsStudio
+            symbols={symbols}
+            selectedSymbol={selectedSymbol}
+            onSelectSymbol={setSelectedSymbol}
+            latestTick={latestTick}
+            liveTapeBuffer={liveTapeBuffer}
+          />
+        )}
+
+        {activeTab === 'terminal' && (
+          <TerminalWorkspace
+            symbols={symbols}
+            symbolsError={symbolsError}
+            selectedSymbol={selectedSymbol}
+            onSelectSymbol={setSelectedSymbol}
+            latestTick={latestTick}
+            feedHealth={feedHealth}
+            onOpenDigits={() => setActiveTab('digits')}
+            onRefreshSymbols={() => void loadSymbols(true)}
+            onOpenConnect={() => setConnectOpen(true)}
+          />
+        )}
+
+        {activeTab === 'risk' && (
+          <RiskAccountsWorkspace
+            paperAccount={paperAccount}
+            derivSession={derivSession}
+            onRefreshSystem={() => void refreshSystemState()}
+          />
+        )}
+      </main>
+
+      {/* Connect Deriv Modal (Auto-OAuth + Instant API Token) */}
       {connectOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
           <div className="w-full max-w-md rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between border-b border-[#E5E9EF] pb-3 dark:border-[#243040]">
               <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
-                Connect Your Deriv Account
+                Connect Deriv Account
               </h2>
               <button
                 type="button"
@@ -630,37 +493,66 @@ export default function App() {
               )}
 
               <div>
-                <label className="block font-semibold text-[#20242B] dark:text-white">
-                  Deriv App ID
-                </label>
-                <div className="mt-1 flex gap-2">
+                <div className="font-semibold text-[#20242B] dark:text-white">
+                  1. Sign in with Deriv (Loads Demo + Real Balances)
+                </div>
+                <p className="mt-1 text-[#6B7280] dark:text-[#9CA3AF]">
+                  Authenticates automatically and loads your Demo and Real accounts in the top bar.
+                </p>
+
+                <div className="mt-2 flex items-center gap-2">
+                  <label className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                    Numeric App ID:
+                  </label>
                   <input
                     type="text"
                     inputMode="numeric"
                     value={appIdInput}
                     onChange={(e) => setAppIdInput(e.target.value)}
-                    placeholder="e.g. 1089 or your App ID"
-                    className="w-36 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-1.5 font-mono text-xs text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                    placeholder="1089"
+                    className="w-28 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-2.5 py-1 font-mono text-xs text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
                   />
-                  <span className="self-center text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                    Numeric ID from developers.deriv.com (1089 for quick testing)
+                  <span className="truncate font-mono text-[10px] text-[#6B7280] dark:text-[#9CA3AF]">
+                    Ref: {PARTNER_REF_CODE}
                   </span>
+                </div>
+
+                <button
+                  type="button"
+                  disabled={connectBusy}
+                  onClick={handleOAuthLogin}
+                  className="mt-2.5 flex w-full items-center justify-center gap-2 rounded-md bg-[#0866FF] px-4 py-2 font-semibold text-white hover:bg-[#0654d4] disabled:opacity-50"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  Continue with Deriv OAuth
+                </button>
+
+                <div className="mt-2 flex items-center justify-between text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+                  <span>New to Deriv?</span>
+                  <a
+                    href={`https://deriv.com/?app_id=${PARTNER_REF_CODE}&l=EN&brand=deriv`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-semibold text-[#0866FF] hover:underline"
+                  >
+                    Open Deriv ({PARTNER_REF_CODE})
+                  </a>
                 </div>
               </div>
 
-              <div>
+              <div className="border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
                 <div className="font-semibold text-[#20242B] dark:text-white">
-                  Option 1 — Instant Connect with Deriv API Token (Fastest)
+                  2. Or Connect Instantly with API Token
                 </div>
                 <p className="mt-1 text-[#6B7280] dark:text-[#9CA3AF]">
-                  Create a token on Deriv (<strong>Account Settings → API Token</strong> with <strong>Read + Trade</strong> enabled) and paste it below. Starts on Demo or Real matching your token.
+                  Paste a Deriv API Token (Read + Trade) or paste your Deriv OAuth callback URL.
                 </p>
                 <form onSubmit={handleTokenLogin} className="mt-2 flex gap-2">
                   <input
                     type="password"
                     value={tokenInput}
                     onChange={(e) => setTokenInput(e.target.value)}
-                    placeholder="Paste your Deriv API Token"
+                    placeholder="Paste Deriv API Token"
                     className="min-w-0 flex-1 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-2 text-xs text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
                   />
                   <button
@@ -673,27 +565,23 @@ export default function App() {
                 </form>
               </div>
 
-              <div className="border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
-                <div className="font-semibold text-[#20242B] dark:text-white">
-                  Option 2 — Login via Deriv OAuth (Demo + Real Switcher)
-                </div>
-                <p className="mt-1 text-[#6B7280] dark:text-[#9CA3AF]">
-                  Loads all your linked Deriv Demo (VRTC) and Real (CR) accounts together. On{' '}
-                  <strong>developers.deriv.com</strong>, make sure <strong>Read + Trade</strong> scopes and this Redirect URL are added:{' '}
-                  <span className="mt-1 block break-all rounded bg-[#F5F7FA] px-2 py-1 font-mono text-[10px] text-[#20242B] dark:bg-[#0F151D] dark:text-[#D1D5DB]">
-                    {typeof window !== 'undefined' ? `${window.location.origin}/api/v1/auth/deriv/callback` : '/api/v1/auth/deriv/callback'}
+              {derivSession.connected && (
+                <div className="flex items-center justify-between border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
+                  <span className="text-[#6B7280] dark:text-[#9CA3AF]">
+                    Connected as {derivSession.activeLoginId}
                   </span>
-                </p>
-                <button
-                  type="button"
-                  disabled={connectBusy}
-                  onClick={handleOAuthLogin}
-                  className="mt-2.5 flex w-full items-center justify-center gap-2 rounded-md bg-[#0866FF] px-4 py-2 font-semibold text-white hover:bg-[#0654d4] disabled:opacity-50"
-                >
-                  <ExternalLink className="h-3.5 w-3.5" />
-                  Continue with Deriv OAuth (App {appIdInput.trim() || derivSession.appId})
-                </button>
-              </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      dqiApi.disconnectDeriv();
+                      setConnectOpen(false);
+                    }}
+                    className="font-semibold text-[#FF444F] hover:underline"
+                  >
+                    Disconnect
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>

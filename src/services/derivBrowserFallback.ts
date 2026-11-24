@@ -14,10 +14,12 @@ const DEFAULT_APP_ID =
   '1089';
 
 const SESSION_STORAGE_KEY = 'dqi_deriv_session_tokens_v1';
+const PARTNER_CODE_DEFAULT = '352P3WGh6Jm4clLrnbq6u';
 
 interface StoredTokenMap {
   activeLoginId: string | null;
   appId?: string;
+  partnerCode?: string;
   tokensByLoginId: Record<string, string>;
 }
 
@@ -128,9 +130,12 @@ class BrowserDerivClient {
       const payload: StoredTokenMap = {
         activeLoginId: this.sessionState.activeLoginId,
         appId: this.appId,
+        partnerCode: PARTNER_CODE_DEFAULT,
         tokensByLoginId: this.tokensByLoginId,
       };
-      window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
+      const serialized = JSON.stringify(payload);
+      window.localStorage.setItem(SESSION_STORAGE_KEY, serialized);
+      window.sessionStorage.setItem(SESSION_STORAGE_KEY, serialized);
     } catch {
       // ignore storage quota errors
     }
@@ -139,10 +144,15 @@ class BrowserDerivClient {
   private restoreFromSessionStorage(): void {
     try {
       if (typeof window === 'undefined') return;
-      const raw = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
+      const raw =
+        window.localStorage.getItem(SESSION_STORAGE_KEY) ||
+        window.sessionStorage.getItem(SESSION_STORAGE_KEY);
       if (!raw) return;
       const parsed = JSON.parse(raw) as StoredTokenMap;
-      if (parsed.appId) this.appId = parsed.appId;
+      if (parsed.appId && /^\d+$/.test(parsed.appId)) {
+        this.appId = parsed.appId;
+        this.sessionState = { ...this.sessionState, appId: parsed.appId };
+      }
       if (parsed.tokensByLoginId && Object.keys(parsed.tokensByLoginId).length > 0) {
         this.tokensByLoginId = parsed.tokensByLoginId;
         const preferred =
@@ -634,6 +644,7 @@ class BrowserDerivClient {
     };
     try {
       if (typeof window !== 'undefined') {
+        window.localStorage.removeItem(SESSION_STORAGE_KEY);
         window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
       }
       this.ws?.send(JSON.stringify({ logout: 1 }));
