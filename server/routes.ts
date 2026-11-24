@@ -1184,38 +1184,322 @@ export function registerApiRoutes(app: Express): void {
 
   // ---------------- DERIV OAUTH & CONTROLLED LIVE EXECUTION ----------------
 
-  app.get('/api/v1/auth/deriv/status', (_req: Request, res: Response) => {
-    const appId = serverConfig.derivAppId || '1089';
-    const customAppConfigured = appId !== '1089';
+  const DERIV_OAUTH_TX_COOKIE = 'dqi_deriv_oauth_tx';
+  const DERIV_OAUTH_SESSION_COOKIE = 'dqi_deriv_oauth_session';
+
+  interface StoredDerivOAuthSession {
+    accessToken: string;
+    refreshToken?: string;
+    expiresAt: number;
+    clientId: string;
+    activeAccountId?: string;
+  }
+
+  interface DerivV2AccountItem {
+    accountId: string;
+    accountType: 'demo' | 'real';
+    isVirtual: boolean;
+    currency: string;
+    balance: number | null;
+    status: string;
+  }
+
+  function readDerivOAuthSession(req: Request): StoredDerivOAuthSession | null {
+    const raw = req.cookies?.[DERIV_OAUTH_SESSION_COOKIE];
+    if (!raw || typeof raw !== 'string') return null;
+    try {
+      const parsed = JSON.parse(decryptSecret(raw)) as StoredDerivOAuthSession;
+      if (!parsed?.accessToken) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveDerivOAuthSession(res: Response, req: Request, sess: StoredDerivOAuthSession): void {
+    const encrypted = encryptSecret(JSON.stringify(sess));
+    setAuthCookie(res, DERIV_OAUTH_SESSION_COOKIE, encrypted, 28800, req);
+  }
+
+  async function refreshDerivOAuthIfNeeded(
+    sess: StoredDerivOAuthSession,
+    res: Response,
+    req: Request
+  ): Promise<StoredDerivOAuthSession> {
+    if (sess.expiresAt > Date.now() + 60_000 || !sess.refreshToken) {
+      return sess;
+    }
+    try {
+      const form = new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: sess.clientId || serverConfig.derivClientId,
+        refresh_token: sess.refreshToken,
+      });
+      const resp = await fetch(new URL('/oauth2/token', serverConfig.derivAuthBaseUrl), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+        body: form,
+      });
+      if (!resp.ok) return sess;
+      const data = (await resp.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      if (!data.access_token) return sess;
+      const updated: StoredDerivOAuthSession = {
+        ...sess,
+        accessToken: data.access_token,
+        refreshToken: data.refresh_token || sess.refreshToken,
+        expiresAt: Date.now() + Number(data.expires_in || 3600) * 1000,
+      };
+      saveDerivOAuthSession(res, req, updated);
+      return updated;
+    } catch {
+      return sess;
+    }
+  }
+
+  async function fetchDerivOptionsAccounts(
+    accessToken: string,
+    clientId: string
+  ): Promise<DerivV2AccountItem[]> {
+    const url = new URL('/trading/v1/options/accounts', serverConfig.derivApiBaseUrl);
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Deriv-App-ID': clientId,
+        Accept: 'application/json',
+      },
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      throw new Error(`Deriv accounts request failed (HTTP ${resp.status}): ${errText.slice(0, 180)}`);
+    }
+    const payload = (await resp.json()) as {
+      data?: Array<Record<string, unknown>>;
+      accounts?: Array<Record<string, unknown>>;
+    };
+    const rows = Array.isArray(payload.data)
+      ? payload.data
+      : Array.isArray(payload.accounts)
+      ? payload.accounts
+      : [];
+    return rows
+      .map((r) => {
+        const accountId = String(r.account_id || r.loginid || r.id || '');
+        const rawType = String(r.account_type || r.type || '').toLowerCase();
+        const isVirtual =
+          rawType === 'demo' ||
+          Boolean(r.is_virtual) ||
+          accountId.startsWith('VRTC') ||
+          accountId.startsWith('DOT');
+        const rawBal = r.balance;
+        const balance =
+          typeof rawBal === 'number'
+            ? rawBal
+            : typeof rawBal === 'string' && rawBal !== '' && Number.isFinite(Number(rawBal))
+            ? Number(rawBal)
+            : null;
+        return {
+          accountId,
+          accountType: (isVirtual ? 'demo' : 'real') as 'demo' | 'real',
+          isVirtual,
+          currency: String(r.currency || 'USD'),
+          balance,
+          status: String(r.status || 'enabled'),
+        };
+      })
+      .filter((a) => Boolean(a.accountId));
+  }
+
+  async function createDerivOptionsOtp(
+    accessToken: string,
+    clientId: string,
+    accountId: string
+  ): Promise<{ url: string; expiresAt: number | null }> {
+    const url = new URL(
+      `/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`,
+      serverConfig.derivApiBaseUrl
+    );
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Deriv-App-ID': clientId,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      throw new Error(`Deriv OTP creation failed (HTTP ${resp.status}): ${errText.slice(0, 180)}`);
+    }
+    const payload = (await resp.json()) as {
+      data?: { url?: string; expires_at?: number };
+      url?: string;
+      expires_at?: number;
+    };
+    const wsUrl = payload.data?.url || payload.url;
+    if (!wsUrl) throw new Error('Deriv OTP endpoint did not return a WebSocket URL');
+    return {
+      url: wsUrl,
+      expiresAt: payload.data?.expires_at ?? payload.expires_at ?? null,
+    };
+  }
+
+  async function fetchOtpBalance(otpWsUrl: string): Promise<{ balance: number | null; currency?: string }> {
+    return new Promise((resolve) => {
+      const ws = new WebSocket(otpWsUrl, { handshakeTimeout: 4500, perMessageDeflate: false });
+      const timer = setTimeout(() => {
+        try {
+          ws.terminate();
+        } catch {
+          // ignore
+        }
+        resolve({ balance: null });
+      }, 5000);
+      ws.once('open', () => {
+        ws.send(JSON.stringify({ balance: 1, req_id: 1 }));
+      });
+      ws.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString()) as {
+            balance?: { balance?: number; currency?: string };
+            error?: unknown;
+          };
+          if (msg.balance && typeof msg.balance.balance === 'number') {
+            clearTimeout(timer);
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            resolve({ balance: Number(msg.balance.balance), currency: msg.balance.currency });
+          } else if (msg.error) {
+            clearTimeout(timer);
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            resolve({ balance: null });
+          }
+        } catch {
+          // ignore parse errors
+        }
+      });
+      ws.once('error', () => {
+        clearTimeout(timer);
+        resolve({ balance: null });
+      });
+    });
+  }
+
+  async function hydrateAccountsWithBalances(
+    accessToken: string,
+    clientId: string,
+    accounts: DerivV2AccountItem[]
+  ): Promise<DerivV2AccountItem[]> {
+    const primaryDemo = accounts.find((a) => a.isVirtual && a.currency === 'USD') || accounts.find((a) => a.isVirtual);
+    const primaryReal = accounts.find((a) => !a.isVirtual && a.currency === 'USD') || accounts.find((a) => !a.isVirtual);
+    const targets = [primaryDemo, primaryReal].filter((a): a is DerivV2AccountItem => Boolean(a));
+
+    await Promise.all(
+      targets.map(async (acct) => {
+        if (acct.balance !== null) return;
+        try {
+          const otp = await createDerivOptionsOtp(accessToken, clientId, acct.accountId);
+          const bal = await fetchOtpBalance(otp.url);
+          if (bal.balance !== null) {
+            acct.balance = bal.balance;
+          }
+          if (bal.currency) {
+            acct.currency = bal.currency;
+          }
+        } catch {
+          // keep null if account OTP unavailable
+        }
+      })
+    );
+    return accounts;
+  }
+
+  app.get('/api/v1/auth/deriv/status', (req: Request, res: Response) => {
+    const sess = readDerivOAuthSession(req);
+    const clientId = serverConfig.derivClientId;
     res.json({
-      configured: true,
-      customAppConfigured,
-      connected: false,
-      appId,
+      configured: isDerivOAuthConfigured(),
+      customAppConfigured: true,
+      connected: Boolean(sess),
+      appId: clientId,
+      redirectUri: serverConfig.derivRedirectUri,
       redirectUriConfigured: Boolean(serverConfig.derivRedirectUri),
-      clientIdConfigured: customAppConfigured,
+      clientIdConfigured: Boolean(clientId),
       scopes: serverConfig.derivOAuthScopes,
-      message: customAppConfigured
-        ? `Ready for Deriv OAuth (App ID ${appId}) or direct API Token login.`
-        : 'Ready with default App ID 1089 (enter your own App ID or connect directly with a Deriv API Token).',
+      message: `Ready for Deriv OAuth (App ID ${clientId}).`,
     });
   });
 
   app.get('/api/v1/auth/deriv/start', (req: Request, res: Response) => {
+    const clientId = serverConfig.derivClientId;
+    const redirectUri = serverConfig.derivRedirectUri;
     const reqAppId = String(req.query.app_id || '').trim();
-    const appId = /^\d+$/.test(reqAppId) ? reqAppId : serverConfig.derivAppId || '1089';
-    const authBase = serverConfig.derivAuthBaseUrl.includes('auth.deriv.com')
-      ? 'https://oauth.deriv.com'
-      : serverConfig.derivAuthBaseUrl;
-    const url = new URL('/oauth2/authorize', authBase);
-    url.searchParams.set('app_id', appId);
-    url.searchParams.set('l', 'EN');
-    url.searchParams.set('brand', 'deriv');
-    res.json({ authorizationUrl: url.toString(), appId });
+    const useLegacyNumeric = /^\d+$/.test(reqAppId) && reqAppId !== clientId;
+
+    if (useLegacyNumeric) {
+      const legacyUrl = new URL('/oauth2/authorize', 'https://oauth.deriv.com');
+      legacyUrl.searchParams.set('app_id', reqAppId);
+      legacyUrl.searchParams.set('l', 'EN');
+      legacyUrl.searchParams.set('brand', 'deriv');
+      res.json({ authorizationUrl: legacyUrl.toString(), appId: reqAppId, redirectUri });
+      return;
+    }
+
+    const state = randomToken(24);
+    const verifier = randomToken(32);
+    const challenge = pkceChallenge(verifier);
+    const encVerifier = encryptSecret(verifier);
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+
+    const proto = req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http');
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    const returnOrigin = host ? `${proto}://${Array.isArray(host) ? host[0] : host}` : serverConfig.appUrl;
+
+    previewStore.oauthTransactions.set(sha256(state), {
+      verifier: encVerifier,
+      redirectUri,
+      expiresAt,
+    });
+
+    // Also persist encrypted PKCE transaction in HttpOnly cookie so Vercel serverless callbacks validate reliably
+    const txCookie = encryptSecret(
+      JSON.stringify({ state, verifier, redirectUri, clientId, returnOrigin, expiresAt })
+    );
+    setAuthCookie(res, DERIV_OAUTH_TX_COOKIE, txCookie, 600, req);
+
+    const authBase = serverConfig.derivAuthBaseUrl || 'https://auth.deriv.com';
+    const url = new URL('/oauth2/auth', authBase);
+    url.searchParams.set('client_id', clientId);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('redirect_uri', redirectUri);
+    url.searchParams.set('scope', serverConfig.derivOAuthScopes || 'trade account_manage');
+    url.searchParams.set('state', state);
+    url.searchParams.set('code_challenge', challenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+
+    res.json({
+      authorizationUrl: url.toString(),
+      appId: clientId,
+      redirectUri,
+      scopes: serverConfig.derivOAuthScopes,
+    });
   });
 
   app.get('/api/v1/auth/deriv/callback', async (req: Request, res: Response) => {
-    // Handle Deriv standard multi-account OAuth callback (?acct1=...&token1=...&cur1=...)
+    // Handle legacy Deriv multi-account OAuth callback (?acct1=...&token1=...&cur1=...) if received
     if (req.query.acct1 && req.query.token1) {
       const qs = new URLSearchParams();
       for (const [k, v] of Object.entries(req.query)) {
@@ -1225,29 +1509,69 @@ export function registerApiRoutes(app: Express): void {
       return;
     }
 
+    const oauthErr = String(req.query.error_description || req.query.error || '');
+    if (oauthErr) {
+      res.redirect(`/?oauth_error=${encodeURIComponent(oauthErr)}`);
+      return;
+    }
+
     const code = String(req.query.code || '');
     const state = String(req.query.state || '');
     if (!code || !state) {
-      res.redirect('/?oauth_error=Missing+Deriv+OAuth+accounts+in+callback');
+      res.redirect('/?oauth_error=Missing+Deriv+OAuth+authorization+code+or+state');
       return;
     }
+
+    // Resolve PKCE transaction from memory store OR encrypted serverless cookie
+    let verifier: string | null = null;
+    let redirectUri = serverConfig.derivRedirectUri;
+    let clientId = serverConfig.derivClientId;
+
     const txKey = sha256(state);
-    const tx = previewStore.oauthTransactions.get(txKey);
-    if (!tx || tx.expiresAt < Date.now()) {
-      res.status(401).json({ error: 'OAUTH_STATE_EXPIRED_OR_INVALID' });
+    const memTx = previewStore.oauthTransactions.get(txKey);
+    if (memTx && memTx.expiresAt > Date.now()) {
+      previewStore.oauthTransactions.delete(txKey);
+      try {
+        verifier = decryptSecret(memTx.verifier);
+        redirectUri = memTx.redirectUri;
+      } catch {
+        verifier = null;
+      }
+    }
+
+    if (!verifier && req.cookies?.[DERIV_OAUTH_TX_COOKIE]) {
+      try {
+        const cookieTx = JSON.parse(decryptSecret(String(req.cookies[DERIV_OAUTH_TX_COOKIE]))) as {
+          state?: string;
+          verifier?: string;
+          redirectUri?: string;
+          clientId?: string;
+          expiresAt?: number;
+        };
+        if (cookieTx.state === state && (cookieTx.expiresAt ?? 0) > Date.now() && cookieTx.verifier) {
+          verifier = cookieTx.verifier;
+          if (cookieTx.redirectUri) redirectUri = cookieTx.redirectUri;
+          if (cookieTx.clientId) clientId = cookieTx.clientId;
+        }
+      } catch {
+        verifier = null;
+      }
+    }
+
+    clearAuthCookie(res, DERIV_OAUTH_TX_COOKIE, req);
+
+    if (!verifier) {
+      res.redirect('/?oauth_error=OAuth+session+expired.+Please+click+Continue+with+Deriv+OAuth+again.');
       return;
     }
-    previewStore.oauthTransactions.delete(txKey);
 
     try {
-      const verifier = decryptSecret(tx.verifier);
-      const pool = getPool();
       const form = new URLSearchParams({
         grant_type: 'authorization_code',
-        client_id: serverConfig.derivClientId,
+        client_id: clientId,
         code,
         code_verifier: verifier,
-        redirect_uri: tx.redirectUri,
+        redirect_uri: redirectUri,
       });
       const tokenResp = await fetch(new URL('/oauth2/token', serverConfig.derivAuthBaseUrl), {
         method: 'POST',
@@ -1255,16 +1579,33 @@ export function registerApiRoutes(app: Express): void {
         body: form,
       });
       if (!tokenResp.ok) {
-        res.status(502).json({ error: `DERIV_TOKEN_EXCHANGE_HTTP_${tokenResp.status}` });
+        const errBody = await tokenResp.text().catch(() => '');
+        res.redirect(
+          `/?oauth_error=${encodeURIComponent(`Deriv token exchange failed (${tokenResp.status}): ${errBody.slice(0, 100)}`)}`
+        );
         return;
       }
-      const tokenData = (await tokenResp.json()) as { access_token?: string; expires_in?: number };
+      const tokenData = (await tokenResp.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
       if (!tokenData.access_token) {
-        res.status(502).json({ error: 'INVALID_DERIV_TOKEN_PAYLOAD' });
+        res.redirect('/?oauth_error=Deriv+returned+no+access_token');
         return;
       }
-      const encrypted = encryptSecret(tokenData.access_token);
+
+      const sessionPayload: StoredDerivOAuthSession = {
+        accessToken: tokenData.access_token,
+        refreshToken: tokenData.refresh_token,
+        expiresAt: Date.now() + Number(tokenData.expires_in || 3600) * 1000,
+        clientId,
+      };
+      saveDerivOAuthSession(res, req, sessionPayload);
+
+      const pool = getPool();
       if (pool) {
+        const encrypted = encryptSecret(tokenData.access_token);
         const user = await pool.query("SELECT user_id FROM app_users WHERE email='dqi-operator@localhost' LIMIT 1");
         if (user.rowCount) {
           await pool.query(
@@ -1274,9 +1615,347 @@ export function registerApiRoutes(app: Express): void {
           );
         }
       }
-      res.redirect(`${serverConfig.appUrl}/?deriv=connected`);
-    } catch {
-      res.status(500).json({ error: 'DERIV_OAUTH_CALLBACK_FAILED' });
+
+      res.redirect('/?deriv=connected');
+    } catch (err) {
+      res.redirect(
+        `/?oauth_error=${encodeURIComponent(err instanceof Error ? err.message : 'Deriv OAuth callback failed')}`
+      );
+    }
+  });
+
+  app.get('/api/v1/auth/deriv/session', async (req: Request, res: Response) => {
+    const existing = readDerivOAuthSession(req);
+    if (!existing) {
+      res.json({ connected: false, appId: serverConfig.derivClientId, accounts: [] });
+      return;
+    }
+    try {
+      const sess = await refreshDerivOAuthIfNeeded(existing, res, req);
+      const rawAccounts = await fetchDerivOptionsAccounts(sess.accessToken, sess.clientId);
+      const accounts = await hydrateAccountsWithBalances(sess.accessToken, sess.clientId, rawAccounts);
+      const preferred =
+        (sess.activeAccountId && accounts.find((a) => a.accountId === sess.activeAccountId)) ||
+        accounts.find((a) => a.isVirtual && a.currency === 'USD') ||
+        accounts.find((a) => a.isVirtual) ||
+        accounts[0] ||
+        null;
+
+      if (preferred && preferred.accountId !== sess.activeAccountId) {
+        saveDerivOAuthSession(res, req, { ...sess, activeAccountId: preferred.accountId });
+      }
+
+      res.json({
+        connected: accounts.length > 0,
+        authMode: 'OAUTH2_V2',
+        appId: sess.clientId,
+        activeLoginId: preferred?.accountId ?? null,
+        activeIsVirtual: preferred?.isVirtual ?? true,
+        activeCurrency: preferred?.currency ?? 'USD',
+        activeBalance: preferred?.balance ?? null,
+        scopes: serverConfig.derivOAuthScopes.split(/\s+/),
+        accounts: accounts.map((a) => ({
+          loginid: a.accountId,
+          currency: a.currency,
+          isVirtual: a.isVirtual,
+          balance: a.balance,
+          hasToken: true,
+          accountCategory: a.accountType,
+        })),
+      });
+    } catch (err) {
+      res.status(401).json({
+        connected: false,
+        appId: serverConfig.derivClientId,
+        accounts: [],
+        error: err instanceof Error ? err.message : 'Deriv OAuth session expired',
+      });
+    }
+  });
+
+  app.post('/api/v1/auth/deriv/connect-token', async (req: Request, res: Response) => {
+    const parsed = z.object({ token: z.string().min(6).max(4096) }).safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Valid Deriv token is required' });
+      return;
+    }
+    const cleanToken = parsed.data.token.trim().replace(/^Bearer\s+/i, '');
+    const clientId = serverConfig.derivClientId;
+    try {
+      const rawAccounts = await fetchDerivOptionsAccounts(cleanToken, clientId);
+      if (rawAccounts.length === 0) {
+        res.status(400).json({ error: 'No Options trading accounts found for this token' });
+        return;
+      }
+      const accounts = await hydrateAccountsWithBalances(cleanToken, clientId, rawAccounts);
+      const preferred =
+        accounts.find((a) => a.isVirtual && a.currency === 'USD') ||
+        accounts.find((a) => a.isVirtual) ||
+        accounts[0];
+      saveDerivOAuthSession(res, req, {
+        accessToken: cleanToken,
+        expiresAt: Date.now() + 28800 * 1000,
+        clientId,
+        activeAccountId: preferred.accountId,
+      });
+
+      res.json({
+        connected: true,
+        authMode: 'OAUTH2_V2',
+        appId: clientId,
+        activeLoginId: preferred.accountId,
+        activeIsVirtual: preferred.isVirtual,
+        activeCurrency: preferred.currency,
+        activeBalance: preferred.balance,
+        scopes: serverConfig.derivOAuthScopes.split(/\s+/),
+        accounts: accounts.map((a) => ({
+          loginid: a.accountId,
+          currency: a.currency,
+          isVirtual: a.isVirtual,
+          balance: a.balance,
+          hasToken: true,
+          accountCategory: a.accountType,
+        })),
+      });
+    } catch (err) {
+      res.status(401).json({
+        error: err instanceof Error ? err.message : 'Deriv token verification failed',
+      });
+    }
+  });
+
+  app.post('/api/v1/auth/deriv/switch', async (req: Request, res: Response) => {
+    const parsed = z.object({ accountId: z.string().min(2).max(64) }).safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid accountId' });
+      return;
+    }
+    const existing = readDerivOAuthSession(req);
+    if (!existing) {
+      res.status(401).json({ error: 'Not authenticated with Deriv OAuth' });
+      return;
+    }
+    try {
+      const sess = await refreshDerivOAuthIfNeeded(existing, res, req);
+      const accounts = await hydrateAccountsWithBalances(
+        sess.accessToken,
+        sess.clientId,
+        await fetchDerivOptionsAccounts(sess.accessToken, sess.clientId)
+      );
+      const target = accounts.find((a) => a.accountId === parsed.data.accountId);
+      if (!target) {
+        res.status(404).json({ error: `Account ${parsed.data.accountId} not found in Deriv profile` });
+        return;
+      }
+      saveDerivOAuthSession(res, req, { ...sess, activeAccountId: target.accountId });
+      res.json({
+        connected: true,
+        authMode: 'OAUTH2_V2',
+        appId: sess.clientId,
+        activeLoginId: target.accountId,
+        activeIsVirtual: target.isVirtual,
+        activeCurrency: target.currency,
+        activeBalance: target.balance,
+        scopes: serverConfig.derivOAuthScopes.split(/\s+/),
+        accounts: accounts.map((a) => ({
+          loginid: a.accountId,
+          currency: a.currency,
+          isVirtual: a.isVirtual,
+          balance: a.balance,
+          hasToken: true,
+          accountCategory: a.accountType,
+        })),
+      });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Failed to switch Deriv account' });
+    }
+  });
+
+  app.post('/api/v1/auth/deriv/logout', (req: Request, res: Response) => {
+    clearAuthCookie(res, DERIV_OAUTH_SESSION_COOKIE, req);
+    clearAuthCookie(res, DERIV_OAUTH_TX_COOKIE, req);
+    res.json({ connected: false });
+  });
+
+  app.post('/api/v1/deriv/v2/otp', async (req: Request, res: Response) => {
+    const existing = readDerivOAuthSession(req);
+    if (!existing) {
+      res.status(401).json({ error: 'Not authenticated with Deriv OAuth' });
+      return;
+    }
+    const parsed = z.object({ accountId: z.string().min(2).max(64).optional() }).safeParse(req.body ?? {});
+    const accountId = parsed.success && parsed.data.accountId ? parsed.data.accountId : existing.activeAccountId;
+    if (!accountId) {
+      res.status(400).json({ error: 'Missing Deriv accountId' });
+      return;
+    }
+    try {
+      const sess = await refreshDerivOAuthIfNeeded(existing, res, req);
+      const otp = await createDerivOptionsOtp(sess.accessToken, sess.clientId, accountId);
+      res.json({ ...otp, accountId, appId: sess.clientId });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Unable to generate Deriv OTP' });
+    }
+  });
+
+  app.post('/api/v1/deriv/v2/buy', async (req: Request, res: Response) => {
+    const existing = readDerivOAuthSession(req);
+    if (!existing) {
+      res.status(401).json({ error: 'Not authenticated with Deriv OAuth' });
+      return;
+    }
+    const schema = z.object({
+      accountId: z.string().min(2).max(64),
+      symbol: z.string().regex(SYMBOL_REGEX),
+      contractType: z.string().min(2).max(32),
+      amount: z.number().positive().max(1000),
+      currency: z.string().min(3).max(8).default('USD'),
+      duration: z.number().int().min(1).max(86400),
+      durationUnit: z.enum(['t', 's', 'm', 'h', 'd']).default('t'),
+      barrier: z.string().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'INVALID_DERIV_V2_BUY_REQUEST' });
+      return;
+    }
+    try {
+      const sess = await refreshDerivOAuthIfNeeded(existing, res, req);
+      const otp = await createDerivOptionsOtp(sess.accessToken, sess.clientId, parsed.data.accountId);
+      const buyResult = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const ws = new WebSocket(otp.url, { handshakeTimeout: 5000, perMessageDeflate: false });
+        const timer = setTimeout(() => {
+          try {
+            ws.terminate();
+          } catch {
+            // ignore
+          }
+          reject(new Error('Deriv OTP trade timed out'));
+        }, 12_000);
+
+        ws.once('open', () => {
+          const propReq: Record<string, unknown> = {
+            proposal: 1,
+            amount: parsed.data.amount,
+            basis: 'stake',
+            contract_type: parsed.data.contractType,
+            currency: parsed.data.currency,
+            duration: parsed.data.duration,
+            duration_unit: parsed.data.durationUnit,
+            underlying_symbol: parsed.data.symbol,
+            req_id: 1,
+          };
+          if (parsed.data.barrier !== undefined && parsed.data.barrier !== '') {
+            propReq.barrier = parsed.data.barrier;
+          }
+          ws.send(JSON.stringify(propReq));
+        });
+
+        ws.on('message', (raw) => {
+          let msg: Record<string, unknown>;
+          try {
+            msg = JSON.parse(raw.toString()) as Record<string, unknown>;
+          } catch {
+            return;
+          }
+          const err = msg.error as { message?: string } | undefined;
+          if (err?.message) {
+            clearTimeout(timer);
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            reject(new Error(err.message));
+            return;
+          }
+          if (msg.req_id === 1 && msg.proposal) {
+            const p = msg.proposal as { id: string; ask_price: number };
+            ws.send(JSON.stringify({ buy: p.id, price: p.ask_price, req_id: 2 }));
+            return;
+          }
+          if (msg.req_id === 2 && msg.buy) {
+            clearTimeout(timer);
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            resolve(msg.buy as Record<string, unknown>);
+          }
+        });
+
+        ws.once('error', (err) => {
+          clearTimeout(timer);
+          reject(new Error(err.message || 'Deriv OTP WebSocket failed'));
+        });
+      });
+
+      res.json({ buy: buyResult, appId: sess.clientId });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Deriv trade placement failed' });
+    }
+  });
+
+  app.post('/api/v1/deriv/v2/contract-status', async (req: Request, res: Response) => {
+    const existing = readDerivOAuthSession(req);
+    if (!existing) {
+      res.status(401).json({ error: 'Not authenticated with Deriv OAuth' });
+      return;
+    }
+    const parsed = z
+      .object({
+        accountId: z.string().min(2).max(64),
+        contractId: z.number().int().positive(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'INVALID_CONTRACT_STATUS_REQUEST' });
+      return;
+    }
+    try {
+      const sess = await refreshDerivOAuthIfNeeded(existing, res, req);
+      const otp = await createDerivOptionsOtp(sess.accessToken, sess.clientId, parsed.data.accountId);
+      const poc = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const ws = new WebSocket(otp.url, { handshakeTimeout: 4500, perMessageDeflate: false });
+        const timer = setTimeout(() => {
+          try {
+            ws.terminate();
+          } catch {
+            // ignore
+          }
+          reject(new Error('Deriv contract status timed out'));
+        }, 7000);
+        ws.once('open', () => {
+          ws.send(JSON.stringify({ proposal_open_contract: 1, contract_id: parsed.data.contractId, req_id: 1 }));
+        });
+        ws.on('message', (raw) => {
+          try {
+            const msg = JSON.parse(raw.toString()) as Record<string, unknown>;
+            const err = msg.error as { message?: string } | undefined;
+            if (err?.message) {
+              clearTimeout(timer);
+              ws.close();
+              reject(new Error(err.message));
+              return;
+            }
+            if (msg.proposal_open_contract) {
+              clearTimeout(timer);
+              ws.close();
+              resolve(msg.proposal_open_contract as Record<string, unknown>);
+            }
+          } catch {
+            // ignore
+          }
+        });
+        ws.once('error', (err) => {
+          clearTimeout(timer);
+          reject(new Error(err.message || 'Deriv OTP WebSocket failed'));
+        });
+      });
+      res.json({ proposal_open_contract: poc });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Unable to fetch contract status' });
     }
   });
 

@@ -405,13 +405,19 @@ export const dqiApi = {
     apiFetch<{ policy: BoundedRecoveryPolicy; worstCaseAdditionalLossPreview: number }>('/api/v1/risk/recovery', payload),
 
   getDerivAuthStatus: () =>
-    apiFetch<{ configured: boolean; customAppConfigured?: boolean; connected: boolean; appId?: string; message: string }>(
-      '/api/v1/auth/deriv/status'
-    ),
+    apiFetch<{
+      configured: boolean;
+      customAppConfigured?: boolean;
+      connected: boolean;
+      appId?: string;
+      redirectUri?: string;
+      scopes?: string;
+      message: string;
+    }>('/api/v1/auth/deriv/status'),
 
-  startDerivOAuth: (appId?: string) =>
-    apiFetch<{ authorizationUrl: string; appId?: string }>(
-      `/api/v1/auth/deriv/start${appId && /^\d+$/.test(appId.trim()) ? `?app_id=${encodeURIComponent(appId.trim())}` : ''}`
+  startDerivOAuth: () =>
+    apiFetch<{ authorizationUrl: string; appId?: string; redirectUri?: string }>(
+      '/api/v1/auth/deriv/start'
     ),
 
   getLiveControl: () =>
@@ -438,6 +444,7 @@ export const dqiApi = {
   setDerivWsBaseUrl: (url: string | null | undefined) => browserDerivPublic.setWsBaseUrl(url),
   getDerivSession: (): DerivSessionState => browserDerivPublic.getSessionState(),
   subscribeDerivSession: (cb: (state: DerivSessionState) => void) => browserDerivPublic.subscribeSession(cb),
+  restoreDerivOAuthSession: () => browserDerivPublic.restoreOAuthSession(),
   authorizeDerivToken: (token: string) => browserDerivPublic.authorizeToken(token),
   authorizeDerivOAuthAccounts: (entries: Array<{ loginid: string; token: string; currency?: string }>) =>
     browserDerivPublic.authorizeOAuthAccounts(entries),

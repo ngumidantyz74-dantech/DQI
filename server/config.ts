@@ -21,6 +21,45 @@ function cleanEnv(raw: string | undefined): string {
   return (raw ?? '').trim().replace(/^["']|["']$/g, '');
 }
 
+export const DEFAULT_DERIV_PARTNER_APP_ID = '352P3WGh6Jm4clLrnbq6u';
+export const DEFAULT_DERIV_CALLBACK_URL = 'https://dqideriv.pipflowtrade.site/api/v1/auth/deriv/callback';
+
+function resolveDerivClientId(): string {
+  const candidates = [
+    cleanEnv(process.env.DERIV_CLIENT_ID),
+    cleanEnv(process.env.DERIV_APP_ID),
+    cleanEnv(process.env.VITE_DERIV_APP_ID),
+  ];
+  for (const c of candidates) {
+    if (c && c !== '1089') return c;
+  }
+  return DEFAULT_DERIV_PARTNER_APP_ID;
+}
+
+function resolveDerivRedirectUri(): string {
+  const raw = cleanEnv(process.env.DERIV_REDIRECT_URI);
+  if (!raw || raw.startsWith('http://localhost')) {
+    return DEFAULT_DERIV_CALLBACK_URL;
+  }
+  return raw;
+}
+
+function resolveDerivOAuthScopes(): string {
+  const raw = cleanEnv(process.env.DERIV_OAUTH_SCOPES);
+  if (!raw || raw === 'read trade' || raw.split(/\s+/).includes('read')) {
+    return 'trade account_manage';
+  }
+  return raw;
+}
+
+function resolveDerivAuthBaseUrl(): string {
+  const raw = cleanEnv(process.env.DERIV_AUTH_BASE_URL);
+  if (!raw || raw.includes('oauth.deriv.com')) {
+    return 'https://auth.deriv.com';
+  }
+  return raw;
+}
+
 function resolveDerivAppId(): string {
   const candidates = [
     cleanEnv(process.env.DERIV_APP_ID),
@@ -47,12 +86,15 @@ export const serverConfig = {
   nodeEnv: process.env.NODE_ENV || 'development',
   isProduction: process.env.NODE_ENV === 'production',
   port: parseNonNegativeInt(process.env.PORT, 3000) || 3000,
-  appUrl: cleanEnv(process.env.APP_URL) || cleanEnv(process.env.WEB_ORIGIN) || 'http://localhost:3000',
+  appUrl:
+    cleanEnv(process.env.APP_URL) ||
+    cleanEnv(process.env.WEB_ORIGIN) ||
+    'https://dqideriv.pipflowtrade.site',
   allowedOrigins: (
     cleanEnv(process.env.QUANT_ALLOWED_ORIGINS) ||
     cleanEnv(process.env.WEB_ORIGIN) ||
     cleanEnv(process.env.APP_URL) ||
-    'http://localhost:3000'
+    'http://localhost:3000,https://dqideriv.pipflowtrade.site'
   )
     .split(',')
     .map((s) => s.trim())
@@ -66,12 +108,12 @@ export const serverConfig = {
     cleanEnv(process.env.POSTGRES_URL) ||
     '',
 
-  derivClientId: cleanEnv(process.env.DERIV_CLIENT_ID),
+  derivClientId: resolveDerivClientId(),
   derivAppId: resolveDerivAppId(),
-  derivRedirectUri: cleanEnv(process.env.DERIV_REDIRECT_URI),
-  derivOAuthScopes: cleanEnv(process.env.DERIV_OAUTH_SCOPES) || 'read trade',
+  derivRedirectUri: resolveDerivRedirectUri(),
+  derivOAuthScopes: resolveDerivOAuthScopes(),
   derivApiBaseUrl: cleanEnv(process.env.DERIV_API_BASE_URL) || 'https://api.derivws.com',
-  derivAuthBaseUrl: cleanEnv(process.env.DERIV_AUTH_BASE_URL) || 'https://oauth.deriv.com',
+  derivAuthBaseUrl: resolveDerivAuthBaseUrl(),
   derivPublicWsUrl: resolveDerivWsUrl(),
 
   sessionSecret: process.env.DQI_SESSION_SECRET || process.env.QUANT_SESSION_SECRET || EPHEMERAL_SESSION_KEY,
@@ -101,5 +143,5 @@ export function getEncryptionKey(): Buffer {
 }
 
 export function isDerivOAuthConfigured(): boolean {
-  return Boolean(serverConfig.derivClientId || serverConfig.derivAppId);
+  return Boolean(serverConfig.derivClientId && serverConfig.derivRedirectUri);
 }

@@ -40,6 +40,7 @@ class BrowserDerivClient {
   private connecting: Promise<WebSocket> | null = null;
   private hostIdx = 0;
   private appId = DEFAULT_APP_ID;
+  private partnerAppId = PARTNER_CODE_DEFAULT;
   private reqId = 1;
   private pending = new Map<
     number,
@@ -50,10 +51,19 @@ class BrowserDerivClient {
   private tickBuffers = new Map<string, LiveTickEvent[]>();
 
   // Authenticated Deriv Account & Real-Time Contract State
+  private authMode: 'NONE' | 'LEGACY_WS' | 'OAUTH2_V2' = 'NONE';
+  private otpWs: WebSocket | null = null;
+  private otpWsConnecting: Promise<WebSocket> | null = null;
+  private otpWsAccountId: string | null = null;
+  private otpReqId = 50000;
+  private otpPending = new Map<
+    number,
+    { resolve: (data: Record<string, unknown>) => void; reject: (err: Error) => void; timer: number }
+  >();
   private tokensByLoginId: Record<string, string> = {};
   private sessionState: DerivSessionState = {
     connected: false,
-    appId: DEFAULT_APP_ID,
+    appId: PARTNER_CODE_DEFAULT,
     activeLoginId: null,
     activeIsVirtual: true,
     activeCurrency: 'USD',
@@ -391,6 +401,7 @@ class BrowserDerivClient {
       | {
           contract_id?: number;
           underlying?: string;
+          underlying_symbol?: string;
           contract_type?: string;
           longcode?: string;
           currency?: string;
@@ -417,7 +428,7 @@ class BrowserDerivClient {
       const existing = this.contractsMap.get(poc.contract_id);
       const contract: LiveDerivContract = {
         contractId: poc.contract_id,
-        symbol: String(poc.underlying || existing?.symbol || ''),
+        symbol: String(poc.underlying_symbol || poc.underlying || existing?.symbol || ''),
         contractType: String(poc.contract_type || existing?.contractType || ''),
         longcode: String(poc.longcode || existing?.longcode || ''),
         currency: String(poc.currency || existing?.currency || this.sessionState.activeCurrency || 'USD'),
@@ -497,7 +508,211 @@ class BrowserDerivClient {
     }
   }
 
-  // ---------------- AUTHENTICATION (DERIV OAUTH & API TOKEN) ----------------
+  // ---------------- AUTHENTICATION (DERIV OAUTH2 V2 & API TOKEN) ----------------
+
+  private closeOtpWs(): void {
+    this.otpWsConnecting = null;
+    this.otpWsAccountId = null;
+    if (this.otpWs) {
+      try {
+        this.otpWs.close();
+      } catch {
+        // ignore
+      }
+      this.otpWs = null;
+    }
+    for (const [id, entry] of this.otpPending.entries()) {
+      window.clearTimeout(entry.timer);
+      entry.reject(new Error('Deriv OTP WebSocket closed'));
+      this.otpPending.delete(id);
+    }
+  }
+
+  private async ensureOtpWs(accountId: string): Promise<WebSocket> {
+    if (this.otpWs && this.otpWs.readyState === WebSocket.OPEN && this.otpWsAccountId === accountId) {
+      return this.otpWs;
+    }
+    if (this.otpWsConnecting && this.otpWsAccountId === accountId) {
+      return this.otpWsConnecting;
+    }
+    if (this.otpWsAccountId && this.otpWsAccountId !== accountId) {
+      this.closeOtpWs();
+    }
+
+    this.otpWsAccountId = accountId;
+    this.otpWsConnecting = (async () => {
+      const otpRes = await fetch('/api/v1/deriv/v2/otp', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'DQI-Client' },
+        body: JSON.stringify({ accountId }),
+      });
+      const otpBody = (await otpRes.json().catch(() => ({}))) as { url?: string; error?: string };
+      if (!otpRes.ok || !otpBody.url) {
+        throw new Error(otpBody.error || 'Unable to obtain Deriv OTP WebSocket URL');
+      }
+
+      const ws = await new Promise<WebSocket>((resolve, reject) => {
+        let settled = false;
+        const socket = new WebSocket(otpBody.url!);
+        const t = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          try {
+            socket.close();
+          } catch {
+            // ignore
+          }
+          reject(new Error('Deriv OTP WebSocket connection timed out'));
+        }, 5000);
+
+        socket.onopen = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(t);
+          resolve(socket);
+        };
+        socket.onerror = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(t);
+          reject(new Error('Deriv OTP WebSocket failed'));
+        };
+        socket.onclose = () => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(t);
+          reject(new Error('Deriv OTP WebSocket closed during handshake'));
+        };
+      });
+
+      this.otpWs = ws;
+      ws.onmessage = (ev) => {
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(String(ev.data)) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+        const reqId = typeof msg.req_id === 'number' ? msg.req_id : null;
+        if (reqId !== null && this.otpPending.has(reqId)) {
+          const entry = this.otpPending.get(reqId)!;
+          this.otpPending.delete(reqId);
+          window.clearTimeout(entry.timer);
+          const errObj = msg.error as { message?: string } | undefined;
+          if (errObj?.message) {
+            entry.reject(new Error(errObj.message));
+          } else {
+            entry.resolve(msg);
+          }
+        }
+        this.handleMessage(String(ev.data));
+      };
+      ws.onclose = () => {
+        if (this.otpWs === ws) {
+          this.otpWs = null;
+        }
+      };
+
+      // Subscribe live balance stream on the OTP-authenticated Options v1 WebSocket
+      ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: this.otpReqId++ }));
+      return ws;
+    })().finally(() => {
+      this.otpWsConnecting = null;
+    });
+
+    return this.otpWsConnecting;
+  }
+
+  private async otpRequest(accountId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const ws = await this.ensureOtpWs(accountId);
+    const id = this.otpReqId++;
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        this.otpPending.delete(id);
+        reject(new Error('Deriv OTP WebSocket request timed out'));
+      }, 10_000);
+      this.otpPending.set(id, { resolve, reject, timer });
+      ws.send(JSON.stringify({ ...payload, req_id: id }));
+    });
+  }
+
+  private applyServerOAuthSessionPayload(data: {
+    connected?: boolean;
+    appId?: string;
+    activeLoginId?: string | null;
+    activeIsVirtual?: boolean;
+    activeCurrency?: string;
+    activeBalance?: number | null;
+    scopes?: string[];
+    accounts?: DerivAccountSummary[];
+  }): DerivSessionState {
+    const accounts = Array.isArray(data.accounts) ? data.accounts : [];
+    const connected = Boolean(data.connected && accounts.length > 0 && data.activeLoginId);
+    this.authMode = connected ? 'OAUTH2_V2' : 'NONE';
+    if (data.appId) this.partnerAppId = data.appId;
+    this.sessionState = {
+      connected,
+      appId: data.appId || this.partnerAppId,
+      activeLoginId: data.activeLoginId ?? null,
+      activeIsVirtual: Boolean(data.activeIsVirtual ?? true),
+      activeCurrency: data.activeCurrency || 'USD',
+      activeBalance: typeof data.activeBalance === 'number' ? data.activeBalance : null,
+      email: null,
+      fullname: null,
+      scopes: Array.isArray(data.scopes) ? data.scopes : [],
+      accounts,
+      error: null,
+    };
+    this.emitSession();
+    if (connected && data.activeLoginId) {
+      void this.ensureOtpWs(data.activeLoginId).catch(() => {});
+    }
+    return this.getSessionState();
+  }
+
+  public async restoreOAuthSession(): Promise<DerivSessionState | null> {
+    try {
+      const res = await fetch('/api/v1/auth/deriv/session', {
+        method: 'GET',
+        credentials: 'include',
+        headers: { Accept: 'application/json' },
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        connected?: boolean;
+        appId?: string;
+        activeLoginId?: string | null;
+        activeIsVirtual?: boolean;
+        activeCurrency?: string;
+        activeBalance?: number | null;
+        scopes?: string[];
+        accounts?: DerivAccountSummary[];
+      };
+      if (!data.connected || !data.activeLoginId) return null;
+      return this.applyServerOAuthSessionPayload(data);
+    } catch {
+      return null;
+    }
+  }
+
+  public async connectOAuthV2Token(token: string): Promise<DerivSessionState> {
+    const res = await fetch('/api/v1/auth/deriv/connect-token', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'DQI-Client',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ token }),
+    });
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok) {
+      throw new Error(String(body.error || 'Deriv v2 token connection failed'));
+    }
+    return this.applyServerOAuthSessionPayload(body as Parameters<BrowserDerivClient['applyServerOAuthSessionPayload']>[0]);
+  }
 
   public async authorizeOAuthAccounts(entries: Array<{ loginid: string; token: string; currency?: string }>): Promise<DerivSessionState> {
     for (const item of entries) {
@@ -505,7 +720,6 @@ class BrowserDerivClient {
         this.tokensByLoginId[item.loginid] = item.token;
       }
     }
-    // Always start safely on Demo (VRTC...) if present
     const defaultEntry = entries.find((e) => e.loginid.startsWith('VRTC')) || entries[0];
     if (!defaultEntry) {
       throw new Error('No Deriv accounts received from OAuth redirect');
@@ -517,91 +731,115 @@ class BrowserDerivClient {
     const cleanToken = token.trim();
     if (!cleanToken) throw new Error('API token cannot be empty');
 
-    const res = await this.request({ authorize: cleanToken });
-    const auth = res.authorize as {
-      loginid: string;
-      balance: number;
-      currency: string;
-      email?: string;
-      fullname?: string;
-      is_virtual: number;
-      scopes?: string[];
-      account_list?: Array<{
-        loginid: string;
-        currency: string;
-        is_virtual: number;
-        account_category?: string;
-        is_disabled?: number;
-      }>;
-    };
-
-    if (!auth?.loginid) {
-      throw new Error('Deriv authorization returned invalid account payload');
+    // Automatically support Deriv v2 Personal Access Tokens / JWT Bearer tokens via App ID 352P3WGh6Jm4clLrnbq6u
+    if (cleanToken.includes('.') && cleanToken.length > 40) {
+      return this.connectOAuthV2Token(cleanToken);
     }
 
-    this.tokensByLoginId[auth.loginid] = cleanToken;
-
-    const existingBalMap = new Map(this.sessionState.accounts.map((a) => [a.loginid, a.balance]));
-    const accounts: DerivAccountSummary[] = (auth.account_list || [])
-      .filter((a) => !a.is_disabled)
-      .map((a) => ({
-        loginid: a.loginid,
-        currency: a.currency || 'USD',
-        isVirtual: Boolean(a.is_virtual),
-        balance: a.loginid === auth.loginid ? Number(auth.balance) : existingBalMap.get(a.loginid) ?? null,
-        hasToken: Boolean(this.tokensByLoginId[a.loginid]),
-        accountCategory: a.account_category,
-      }));
-
-    if (!accounts.some((a) => a.loginid === auth.loginid)) {
-      accounts.unshift({
-        loginid: auth.loginid,
-        currency: auth.currency || 'USD',
-        isVirtual: Boolean(auth.is_virtual),
-        balance: Number(auth.balance),
-        hasToken: true,
-      });
-    }
-
-    this.sessionState = {
-      connected: true,
-      appId: this.appId,
-      activeLoginId: auth.loginid,
-      activeIsVirtual: Boolean(auth.is_virtual),
-      activeCurrency: auth.currency || 'USD',
-      activeBalance: Number(auth.balance),
-      email: auth.email || null,
-      fullname: auth.fullname || null,
-      scopes: auth.scopes || [],
-      accounts,
-      error: null,
-    };
-
-    if (!opts?.skipSave) {
-      this.saveToSessionStorage();
-    }
-    this.emitSession();
-
-    // Subscribe to live balance updates across ALL linked Demo & Real accounts
-    await this.refreshAllBalances(true);
-
-    // Load any currently open contracts on this Deriv account
     try {
-      const portfolio = await this.request({ portfolio: 1 });
-      const list = (portfolio.portfolio as { contracts?: Array<{ contract_id: number }> })?.contracts || [];
-      for (const c of list.slice(0, 10)) {
-        if (c.contract_id) {
-          void this.request({ proposal_open_contract: 1, contract_id: c.contract_id, subscribe: 1 }).catch(() => {});
-        }
-      }
-    } catch {
-      // ignore if portfolio empty or read restricted
-    }
+      const res = await this.request({ authorize: cleanToken });
+      const auth = res.authorize as {
+        loginid: string;
+        balance: number;
+        currency: string;
+        email?: string;
+        fullname?: string;
+        is_virtual: number;
+        scopes?: string[];
+        account_list?: Array<{
+          loginid: string;
+          currency: string;
+          is_virtual: number;
+          account_category?: string;
+          is_disabled?: number;
+        }>;
+      };
 
-    return this.getSessionState();
+      if (!auth?.loginid) {
+        throw new Error('Deriv authorization returned invalid account payload');
+      }
+
+      this.authMode = 'LEGACY_WS';
+      this.tokensByLoginId[auth.loginid] = cleanToken;
+
+      const existingBalMap = new Map(this.sessionState.accounts.map((a) => [a.loginid, a.balance]));
+      const accounts: DerivAccountSummary[] = (auth.account_list || [])
+        .filter((a) => !a.is_disabled)
+        .map((a) => ({
+          loginid: a.loginid,
+          currency: a.currency || 'USD',
+          isVirtual: Boolean(a.is_virtual),
+          balance: a.loginid === auth.loginid ? Number(auth.balance) : existingBalMap.get(a.loginid) ?? null,
+          hasToken: Boolean(this.tokensByLoginId[a.loginid]),
+          accountCategory: a.account_category,
+        }));
+
+      if (!accounts.some((a) => a.loginid === auth.loginid)) {
+        accounts.unshift({
+          loginid: auth.loginid,
+          currency: auth.currency || 'USD',
+          isVirtual: Boolean(auth.is_virtual),
+          balance: Number(auth.balance),
+          hasToken: true,
+        });
+      }
+
+      this.sessionState = {
+        connected: true,
+        appId: this.appId,
+        activeLoginId: auth.loginid,
+        activeIsVirtual: Boolean(auth.is_virtual),
+        activeCurrency: auth.currency || 'USD',
+        activeBalance: Number(auth.balance),
+        email: auth.email || null,
+        fullname: auth.fullname || null,
+        scopes: auth.scopes || [],
+        accounts,
+        error: null,
+      };
+
+      if (!opts?.skipSave) {
+        this.saveToSessionStorage();
+      }
+      this.emitSession();
+
+      await this.refreshAllBalances(true);
+
+      try {
+        const portfolio = await this.request({ portfolio: 1 });
+        const list = (portfolio.portfolio as { contracts?: Array<{ contract_id: number }> })?.contracts || [];
+        for (const c of list.slice(0, 10)) {
+          if (c.contract_id) {
+            void this.request({ proposal_open_contract: 1, contract_id: c.contract_id, subscribe: 1 }).catch(() => {});
+          }
+        }
+      } catch {
+        // ignore if portfolio empty or read restricted
+      }
+
+      return this.getSessionState();
+    } catch (legacyErr) {
+      // Fallback: if token is a Deriv Developers Portal PAT without dots, verify via v2 /options/accounts
+      try {
+        return await this.connectOAuthV2Token(cleanToken);
+      } catch {
+        throw legacyErr;
+      }
+    }
   }
 
   public async refreshAllBalances(subscribe = false): Promise<void> {
+    if (this.authMode === 'OAUTH2_V2') {
+      await this.restoreOAuthSession();
+      if (this.sessionState.activeLoginId && this.otpWs?.readyState === WebSocket.OPEN) {
+        try {
+          this.otpWs.send(JSON.stringify({ balance: 1, req_id: this.otpReqId++ }));
+        } catch {
+          // ignore
+        }
+      }
+      return;
+    }
     try {
       if (subscribe && !this.balanceSubActive) {
         this.balanceSubActive = true;
@@ -619,22 +857,43 @@ class BrowserDerivClient {
   }
 
   public async switchAccount(loginid: string): Promise<DerivSessionState> {
+    if (this.authMode === 'OAUTH2_V2') {
+      const res = await fetch('/api/v1/auth/deriv/switch', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'DQI-Client',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ accountId: loginid }),
+      });
+      const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!res.ok) {
+        throw new Error(String(body.error || `Unable to switch to ${loginid}`));
+      }
+      this.closeOtpWs();
+      return this.applyServerOAuthSessionPayload(body as Parameters<BrowserDerivClient['applyServerOAuthSessionPayload']>[0]);
+    }
+
     const token = this.tokensByLoginId[loginid];
     if (!token) {
       throw new Error(
-        `No API token stored for ${loginid}. Connect via Deriv OAuth or enter a token generated for ${loginid} on app.deriv.com/account/api-token.`
+        `No API token stored for ${loginid}. Connect via Deriv OAuth or enter a token generated for ${loginid}.`
       );
     }
     return this.authorizeToken(token);
   }
 
   public disconnectSession(): void {
+    this.authMode = 'NONE';
     this.tokensByLoginId = {};
     this.contractsMap.clear();
     this.balanceSubActive = false;
+    this.closeOtpWs();
     this.sessionState = {
       connected: false,
-      appId: this.appId,
+      appId: this.partnerAppId,
       activeLoginId: null,
       activeIsVirtual: true,
       activeCurrency: 'USD',
@@ -654,6 +913,11 @@ class BrowserDerivClient {
     } catch {
       // ignore
     }
+    void fetch('/api/v1/auth/deriv/logout', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'DQI-Client' },
+    }).catch(() => {});
     this.emitContracts();
     this.emitSession();
   }
@@ -673,6 +937,117 @@ class BrowserDerivClient {
     }
 
     const currency = this.sessionState.activeCurrency || 'USD';
+    const accountId = this.sessionState.activeLoginId;
+
+    // Authenticated OAuth2 v2 / Options v1 OTP execution attributed to App ID 352P3WGh6Jm4clLrnbq6u
+    if (this.authMode === 'OAUTH2_V2') {
+      let buy: {
+        contract_id: number;
+        buy_price: number;
+        payout: number;
+        longcode: string;
+        balance_after: number;
+        start_time: number;
+      };
+      let usedOtpWs = false;
+
+      try {
+        const propPayload: Record<string, unknown> = {
+          proposal: 1,
+          amount: payload.amount,
+          basis: 'stake',
+          contract_type: payload.contractType,
+          currency,
+          duration: payload.duration,
+          duration_unit: payload.durationUnit,
+          underlying_symbol: payload.symbol,
+        };
+        if (payload.barrier !== undefined && payload.barrier !== '') {
+          propPayload.barrier = payload.barrier;
+        }
+        const propRes = await this.otpRequest(accountId, propPayload);
+        const prop = propRes.proposal as { id: string; ask_price: number };
+        if (!prop?.id) throw new Error('Deriv did not return a valid proposal');
+        const buyRes = await this.otpRequest(accountId, { buy: prop.id, price: prop.ask_price });
+        buy = buyRes.buy as typeof buy;
+        usedOtpWs = true;
+      } catch {
+        const res = await fetch('/api/v1/deriv/v2/buy', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'DQI-Client',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            accountId,
+            symbol: payload.symbol,
+            contractType: payload.contractType,
+            amount: payload.amount,
+            currency,
+            duration: payload.duration,
+            durationUnit: payload.durationUnit,
+            barrier: payload.barrier,
+          }),
+        });
+        const body = (await res.json().catch(() => ({}))) as { buy?: typeof buy; error?: string };
+        if (!res.ok || !body.buy) {
+          throw new Error(body.error || 'Deriv trade placement failed');
+        }
+        buy = body.buy;
+      }
+
+      const initialContract: LiveDerivContract = {
+        contractId: buy.contract_id,
+        symbol: payload.symbol,
+        contractType: payload.contractType,
+        longcode: buy.longcode || `${payload.contractType} ${payload.symbol}`,
+        currency,
+        buyPrice: Number(buy.buy_price),
+        payout: Number(buy.payout),
+        bidPrice: Number(buy.buy_price),
+        profit: 0,
+        profitPct: 0,
+        entrySpot: null,
+        currentSpot: null,
+        barrier: payload.barrier ?? null,
+        isSold: false,
+        isExpired: false,
+        status: 'open',
+        dateStart: Number(buy.start_time || Math.floor(Date.now() / 1000)),
+        dateExpiry: null,
+        tickCount: payload.durationUnit === 't' ? payload.duration : null,
+        isVirtual: this.sessionState.activeIsVirtual,
+        loginid: accountId,
+      };
+
+      this.contractsMap.set(buy.contract_id, initialContract);
+      if (typeof buy.balance_after === 'number') {
+        this.sessionState = {
+          ...this.sessionState,
+          activeBalance: Number(buy.balance_after),
+          accounts: this.sessionState.accounts.map((a) =>
+            a.loginid === accountId ? { ...a, balance: Number(buy.balance_after) } : a
+          ),
+        };
+        this.emitSession();
+      }
+      this.emitContracts();
+
+      if (usedOtpWs && this.otpWs?.readyState === WebSocket.OPEN) {
+        void this.otpRequest(accountId, {
+          proposal_open_contract: 1,
+          contract_id: buy.contract_id,
+          subscribe: 1,
+        }).catch(() => {});
+      } else {
+        this.ensureContractProxyPolling();
+      }
+
+      return initialContract;
+    }
+
     const parameters: Record<string, unknown> = {
       amount: payload.amount,
       basis: 'stake',
@@ -738,7 +1113,6 @@ class BrowserDerivClient {
     }
     this.emitContracts();
 
-    // Subscribe to real-time tick-by-tick P&L calculation (proposal_open_contract)
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       void this.request({
         proposal_open_contract: 1,
@@ -746,7 +1120,6 @@ class BrowserDerivClient {
         subscribe: 1,
       }).catch(() => {});
     } else {
-      // Poll live P&L over HTTPS proxy when WS isn't open
       this.ensureContractProxyPolling();
     }
 
@@ -757,7 +1130,11 @@ class BrowserDerivClient {
     if (this.contractPollTimer !== null) return;
     this.contractPollTimer = window.setInterval(() => {
       const openList = Array.from(this.contractsMap.values()).filter((c) => !c.isSold && !c.isExpired);
-      if (openList.length === 0 || (this.ws && this.ws.readyState === WebSocket.OPEN)) {
+      const wsReady =
+        this.authMode === 'OAUTH2_V2'
+          ? this.otpWs && this.otpWs.readyState === WebSocket.OPEN
+          : this.ws && this.ws.readyState === WebSocket.OPEN;
+      if (openList.length === 0 || wsReady) {
         if (this.contractPollTimer !== null) {
           window.clearInterval(this.contractPollTimer);
           this.contractPollTimer = null;
@@ -765,12 +1142,39 @@ class BrowserDerivClient {
         return;
       }
       for (const c of openList.slice(0, 6)) {
-        void this.requestViaProxy({ proposal_open_contract: 1, contract_id: c.contractId }).catch(() => {});
+        if (this.authMode === 'OAUTH2_V2') {
+          void fetch('/api/v1/deriv/v2/contract-status', {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Requested-With': 'DQI-Client',
+            },
+            body: JSON.stringify({ accountId: c.loginid, contractId: c.contractId }),
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data) => {
+              if (data?.proposal_open_contract) {
+                this.handleMessage(JSON.stringify(data));
+              }
+            })
+            .catch(() => {});
+        } else {
+          void this.requestViaProxy({ proposal_open_contract: 1, contract_id: c.contractId }).catch(() => {});
+        }
       }
     }, 1500);
   }
 
   public async sellContract(contractId: number): Promise<void> {
+    if (this.authMode === 'OAUTH2_V2' && this.sessionState.activeLoginId) {
+      await this.otpRequest(this.sessionState.activeLoginId, { sell: contractId, price: 0 });
+      await this.otpRequest(this.sessionState.activeLoginId, {
+        proposal_open_contract: 1,
+        contract_id: contractId,
+      }).catch(() => {});
+      return;
+    }
     await this.request({ sell: contractId, price: 0 });
     await this.request({ proposal_open_contract: 1, contract_id: contractId }).catch(() => {});
   }

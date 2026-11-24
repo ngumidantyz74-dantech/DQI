@@ -22,6 +22,7 @@ import { DigitsStudio } from './components/DigitsStudio';
 import { RiskAccountsWorkspace } from './components/RiskAccountsWorkspace';
 
 const PARTNER_REF_CODE = '352P3WGh6Jm4clLrnbq6u';
+const DEFAULT_CALLBACK_URI = 'https://dqideriv.pipflowtrade.site/api/v1/auth/deriv/callback';
 
 const NAV_TABS: Array<{ id: DqiTab; label: string }> = [
   { id: 'analyser', label: 'Bot & Scanner' },
@@ -64,7 +65,8 @@ export default function App() {
   // Connect Deriv Modal
   const [connectOpen, setConnectOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState('');
-  const [appIdInput, setAppIdInput] = useState(() => dqiApi.getDerivSession().appId || '1089');
+  const [configuredAppId, setConfiguredAppId] = useState(PARTNER_REF_CODE);
+  const [configuredRedirectUri, setConfiguredRedirectUri] = useState(DEFAULT_CALLBACK_URI);
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectErr, setConnectErr] = useState<string | null>(null);
 
@@ -90,18 +92,22 @@ export default function App() {
     };
   }, []);
 
-  // Automatic Deriv OAuth callback parser + system App ID loader
+  // Automatic Deriv OAuth2 session restoration, callback parser, and config loader
   useEffect(() => {
     void (async () => {
       try {
-        const st = await dqiApi.getSystemStatus();
+        const [st, authSt] = await Promise.all([
+          dqiApi.getSystemStatus().catch(() => null),
+          dqiApi.getDerivAuthStatus().catch(() => null),
+        ]);
         if (st?.derivWsUrl) dqiApi.setDerivWsBaseUrl(st.derivWsUrl);
         if (st?.derivAppId && /^\d+$/.test(st.derivAppId)) {
           dqiApi.setDerivAppId(st.derivAppId);
-          setAppIdInput(st.derivAppId);
         }
+        if (authSt?.appId) setConfiguredAppId(authSt.appId);
+        if (authSt?.redirectUri) setConfiguredRedirectUri(authSt.redirectUri);
       } catch {
-        // default 1089
+        // use configured defaults
       }
 
       const params = new URLSearchParams(window.location.search);
@@ -130,12 +136,18 @@ export default function App() {
 
       const oauthState = params.get('deriv_oauth') || params.get('deriv');
       const oauthErr = params.get('oauth_error');
-      if (oauthState === 'connected') {
-        setGlobalNotice('Deriv account connected.');
-        window.history.replaceState({}, '', window.location.pathname);
-      } else if (oauthErr) {
+      if (oauthErr) {
         setGlobalNotice(`Deriv OAuth notice: ${oauthErr}`);
         window.history.replaceState({}, '', window.location.pathname);
+      } else if (oauthState === 'connected') {
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+
+      const restored = await dqiApi.restoreDerivOAuthSession();
+      if (restored?.connected && oauthState === 'connected') {
+        setGlobalNotice(
+          `Connected via Deriv App ${restored.appId}. Active: ${restored.activeIsVirtual ? 'DEMO' : 'REAL'} (${restored.activeLoginId}).`
+        );
       }
     })();
   }, []);
@@ -207,10 +219,7 @@ export default function App() {
     setConnectBusy(true);
     setConnectErr(null);
     try {
-      const cleanId = appIdInput.trim();
-      const numericId = /^\d+$/.test(cleanId) ? cleanId : '1089';
-      dqiApi.setDerivAppId(numericId, true);
-      const res = await dqiApi.startDerivOAuth(numericId);
+      const res = await dqiApi.startDerivOAuth();
       window.location.assign(res.authorizationUrl);
     } catch (err) {
       setConnectErr(err instanceof Error ? err.message : 'Could not start Deriv OAuth');
@@ -225,10 +234,6 @@ export default function App() {
     setConnectBusy(true);
     setConnectErr(null);
     try {
-      const cleanId = appIdInput.trim();
-      if (/^\d+$/.test(cleanId)) {
-        dqiApi.setDerivAppId(cleanId, true);
-      }
 
       // Support pasting full OAuth redirect URL (?acct1=...&token1=...)
       if (raw.includes('acct1=') && raw.includes('token1=')) {
@@ -524,24 +529,17 @@ export default function App() {
                   1. Sign in with Deriv (Loads Demo + Real Balances)
                 </div>
                 <p className="mt-1 text-[#6B7280] dark:text-[#9CA3AF]">
-                  Authenticates automatically and loads your Demo and Real accounts in the top bar.
+                  Authenticates through your Deriv App so all Demo and Real trades route through your app ID.
                 </p>
 
-                <div className="mt-2 flex items-center gap-2">
-                  <label className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                    Numeric App ID:
-                  </label>
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    value={appIdInput}
-                    onChange={(e) => setAppIdInput(e.target.value)}
-                    placeholder="1089"
-                    className="w-28 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-2.5 py-1 font-mono text-xs text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
-                  />
-                  <span className="truncate font-mono text-[10px] text-[#6B7280] dark:text-[#9CA3AF]">
-                    Ref: {PARTNER_REF_CODE}
-                  </span>
+                <div className="mt-2.5 space-y-1 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-2 font-mono text-[11px] text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[#6B7280] dark:text-[#9CA3AF]">App ID</span>
+                    <span className="font-bold text-[#0866FF]">{configuredAppId}</span>
+                  </div>
+                  <div className="truncate text-[10px] text-[#6B7280] dark:text-[#9CA3AF]" title={configuredRedirectUri}>
+                    Callback: {configuredRedirectUri}
+                  </div>
                 </div>
 
                 <button
@@ -557,12 +555,12 @@ export default function App() {
                 <div className="mt-2 flex items-center justify-between text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
                   <span>New to Deriv?</span>
                   <a
-                    href={`https://deriv.com/?app_id=${PARTNER_REF_CODE}&l=EN&brand=deriv`}
+                    href={`https://deriv.com/?app_id=${configuredAppId}&l=EN&brand=deriv`}
                     target="_blank"
                     rel="noreferrer"
                     className="font-semibold text-[#0866FF] hover:underline"
                   >
-                    Open Deriv ({PARTNER_REF_CODE})
+                    Create Deriv Account
                   </a>
                 </div>
               </div>
@@ -572,7 +570,7 @@ export default function App() {
                   2. Or Connect Instantly with API Token
                 </div>
                 <p className="mt-1 text-[#6B7280] dark:text-[#9CA3AF]">
-                  Paste a Deriv API Token (Read + Trade) or paste your Deriv OAuth callback URL.
+                  Paste a Deriv Personal Access Token (PAT) or API Token to load Demo and Real balances.
                 </p>
                 <form onSubmit={handleTokenLogin} className="mt-2 flex gap-2">
                   <input
