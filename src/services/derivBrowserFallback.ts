@@ -67,24 +67,43 @@ class BrowserDerivClient {
   private contractListeners = new Set<(contracts: LiveDerivContract[]) => void>();
   private balanceSubActive = false;
 
+  private customWsBaseUrl: string | null = null;
+  private contractPollTimer: number | null = null;
+
   constructor() {
     this.restoreFromSessionStorage();
   }
 
   private wsUrls(): string[] {
     const id = encodeURIComponent(this.appId || '1089');
-    return [
+    const urls = [
+      this.customWsBaseUrl
+        ? `${this.customWsBaseUrl}${this.customWsBaseUrl.includes('?') ? '&' : '?'}app_id=${id}`
+        : null,
       `wss://ws.derivws.com/websockets/v3?app_id=${id}`,
+      `wss://frontend.derivws.com/websockets/v3?app_id=${id}`,
       `wss://green.derivws.com/websockets/v3?app_id=${id}`,
       `wss://blue.derivws.com/websockets/v3?app_id=${id}`,
-    ];
+      `wss://red.derivws.com/websockets/v3?app_id=${id}`,
+      `wss://ws.binaryws.com/websockets/v3?app_id=${id}`,
+    ].filter((u): u is string => Boolean(u));
+    return Array.from(new Set(urls));
   }
 
-  public setAppId(nextAppId: string): void {
+  public setWsBaseUrl(url: string | null | undefined): void {
+    const clean = (url ?? '').trim();
+    if (!clean) return;
+    if (clean.startsWith('wss://') || clean.startsWith('ws://')) {
+      this.customWsBaseUrl = clean.split('?')[0];
+    }
+  }
+
+  public setAppId(nextAppId: string, persist = false): void {
     const clean = nextAppId.trim();
-    if (!clean || clean === this.appId) return;
+    if (!/^\d+$/.test(clean) || clean === this.appId) return;
     this.appId = clean;
     this.sessionState = { ...this.sessionState, appId: clean };
+    this.connecting = null;
     if (this.ws) {
       try {
         this.ws.close();
@@ -92,6 +111,9 @@ class BrowserDerivClient {
         // ignore
       }
       this.ws = null;
+    }
+    if (persist) {
+      this.saveToSessionStorage();
     }
     this.emitSession();
   }
@@ -187,23 +209,36 @@ class BrowserDerivClient {
         const url = hosts[idx];
         try {
           const ws = await new Promise<WebSocket>((resolve, reject) => {
+            let settled = false;
             const socket = new WebSocket(url);
             const t = window.setTimeout(() => {
+              if (settled) return;
+              settled = true;
               try {
                 socket.close();
               } catch {
                 // ignore
               }
-              reject(new Error('Deriv WebSocket connection timed out'));
-            }, 6500);
+              reject(new Error(`Deriv WebSocket timed out (${new URL(url).host})`));
+            }, 3500);
 
             socket.onopen = () => {
+              if (settled) return;
+              settled = true;
               window.clearTimeout(t);
               resolve(socket);
             };
             socket.onerror = () => {
+              if (settled) return;
+              settled = true;
               window.clearTimeout(t);
-              reject(new Error('Deriv WebSocket connection failed'));
+              reject(new Error(`Deriv WebSocket failed (${new URL(url).host})`));
+            };
+            socket.onclose = (ev) => {
+              if (settled) return;
+              settled = true;
+              window.clearTimeout(t);
+              reject(new Error(`Deriv WebSocket closed (${ev.code})`));
             };
           });
 
@@ -240,7 +275,7 @@ class BrowserDerivClient {
           lastErr = err instanceof Error ? err : new Error(String(err));
         }
       }
-      throw lastErr || new Error('Unable to connect to Deriv public WebSocket');
+      throw lastErr || new Error('Unable to connect to Deriv WebSocket');
     })().finally(() => {
       this.connecting = null;
     });
@@ -400,17 +435,56 @@ class BrowserDerivClient {
     }
   }
 
-  private async request(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const ws = await this.ensureWs();
-    const id = this.reqId++;
-    return new Promise((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error('Deriv request timed out'));
-      }, 12_000);
-      this.pending.set(id, { resolve, reject, timer });
-      ws.send(JSON.stringify({ ...payload, req_id: id }));
+  private async requestViaProxy(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const activeToken =
+      this.sessionState.activeLoginId && this.tokensByLoginId[this.sessionState.activeLoginId]
+        ? this.tokensByLoginId[this.sessionState.activeLoginId]
+        : undefined;
+    const needsAuth =
+      'balance' in payload ||
+      'portfolio' in payload ||
+      'proposal_open_contract' in payload ||
+      'buy' in payload ||
+      'sell' in payload;
+    const res = await fetch('/api/v1/deriv/proxy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        appId: /^\d+$/.test(this.appId) ? this.appId : '1089',
+        token: needsAuth ? activeToken : undefined,
+        payload,
+      }),
     });
+    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok) {
+      throw new Error(String(body.error || `Deriv proxy failed (HTTP ${res.status})`));
+    }
+    this.handleMessage(JSON.stringify(body));
+    return body;
+  }
+
+  private async request(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    try {
+      const ws = await this.ensureWs();
+      const id = this.reqId++;
+      return await new Promise((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error('Deriv request timed out'));
+        }, 12_000);
+        this.pending.set(id, { resolve, reject, timer });
+        ws.send(JSON.stringify({ ...payload, req_id: id }));
+      });
+    } catch (wsErr) {
+      // Fall back transparently to stateless HTTPS proxy when browser WS is blocked
+      try {
+        return await this.requestViaProxy(payload);
+      } catch (proxyErr) {
+        const wsMsg = wsErr instanceof Error ? wsErr.message : 'WebSocket failed';
+        const pxMsg = proxyErr instanceof Error ? proxyErr.message : 'Proxy failed';
+        throw new Error(`${wsMsg} · Fallback: ${pxMsg}`);
+      }
+    }
   }
 
   // ---------------- AUTHENTICATION (DERIV OAUTH & API TOKEN) ----------------
@@ -651,13 +725,35 @@ class BrowserDerivClient {
     this.emitContracts();
 
     // Subscribe to real-time tick-by-tick P&L calculation (proposal_open_contract)
-    void this.request({
-      proposal_open_contract: 1,
-      contract_id: buy.contract_id,
-      subscribe: 1,
-    }).catch(() => {});
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      void this.request({
+        proposal_open_contract: 1,
+        contract_id: buy.contract_id,
+        subscribe: 1,
+      }).catch(() => {});
+    } else {
+      // Poll live P&L over HTTPS proxy when WS isn't open
+      this.ensureContractProxyPolling();
+    }
 
     return initialContract;
+  }
+
+  private ensureContractProxyPolling(): void {
+    if (this.contractPollTimer !== null) return;
+    this.contractPollTimer = window.setInterval(() => {
+      const openList = Array.from(this.contractsMap.values()).filter((c) => !c.isSold && !c.isExpired);
+      if (openList.length === 0 || (this.ws && this.ws.readyState === WebSocket.OPEN)) {
+        if (this.contractPollTimer !== null) {
+          window.clearInterval(this.contractPollTimer);
+          this.contractPollTimer = null;
+        }
+        return;
+      }
+      for (const c of openList.slice(0, 6)) {
+        void this.requestViaProxy({ proposal_open_contract: 1, contract_id: c.contractId }).catch(() => {});
+      }
+    }, 1500);
   }
 
   public async sellContract(contractId: number): Promise<void> {
@@ -817,29 +913,92 @@ class BrowserDerivClient {
     };
     set.add(cb);
 
-    void (async () => {
-      try {
-        const ws = await this.ensureWs();
+    let pollTimer: number | null = null;
+    let retryTimer: number | null = null;
+    let lastEpochSent = 0;
+
+    const startProxyPolling = () => {
+      if (pollTimer !== null || closed) return;
+      pollTimer = window.setInterval(async () => {
         if (closed) return;
+        // If WS recovered in the meantime, stop polling
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          if (pollTimer !== null) {
+            window.clearInterval(pollTimer);
+            pollTimer = null;
+          }
+          return;
+        }
+        try {
+          const res = await this.requestViaProxy({ ticks: symbol });
+          const t = res.tick as { symbol?: string; epoch?: number; quote?: number; pip_size?: number } | undefined;
+          if (t?.quote !== undefined && t.epoch !== undefined && t.epoch !== lastEpochSent) {
+            lastEpochSent = t.epoch;
+            const pipSize =
+              typeof t.pip_size === 'number' ? t.pip_size : this.pipSizeBySymbol.get(symbol) ?? 2;
+            this.pipSizeBySymbol.set(symbol, pipSize);
+            const parsed = extractLastDigitFromQuote(t.quote, pipSize);
+            handlers.onTick?.({
+              symbol,
+              epoch: t.epoch,
+              rawQuote: parsed.rawQuote,
+              quote: parsed.quote,
+              pipSize,
+              lastDigit: parsed.lastDigit,
+              receivedAt: new Date(t.epoch * 1000).toISOString(),
+              source: 'DERIV_PROXY_LIVE',
+            });
+            handlers.onHealth?.({ connectionState: 'LIVE', isStale: false, ageSeconds: 0 });
+          }
+        } catch {
+          // keep trying cleanly
+        }
+      }, 1500);
+    };
+
+    const connectStream = async (attempt = 0) => {
+      if (closed) return;
+      try {
         const history = await this.fetchTickHistory(symbol, 120);
         if (closed) return;
-        handlers.onReady?.({
-          symbol,
-          bufferedCount: history.length,
-          pipSize: this.pipSizeBySymbol.get(symbol) ?? 2,
-        });
-        handlers.onHistory?.(history);
-        handlers.onHealth?.({ connectionState: 'LIVE', isStale: false, ageSeconds: 0 });
-        ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
+        if (history.length > 0) {
+          lastEpochSent = history[history.length - 1].epoch;
+          handlers.onReady?.({
+            symbol,
+            bufferedCount: history.length,
+            pipSize: this.pipSizeBySymbol.get(symbol) ?? 2,
+          });
+          handlers.onHistory?.(history);
+        }
+
+        // Try direct WS for millisecond push ticks; fall back to proxy polling if WS blocked
+        try {
+          const ws = await this.ensureWs();
+          if (!closed && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
+            handlers.onHealth?.({ connectionState: 'LIVE', isStale: false, ageSeconds: 0 });
+            return;
+          }
+        } catch {
+          handlers.onHealth?.({ connectionState: 'LIVE', isStale: false, ageSeconds: 0 });
+          startProxyPolling();
+          return;
+        }
       } catch (err) {
         if (!closed) {
           handlers.onError?.(err instanceof Error ? err.message : 'Deriv WebSocket connection failed');
+          const delay = Math.min(15_000, 3_000 * Math.max(1, attempt + 1));
+          retryTimer = window.setTimeout(() => void connectStream(attempt + 1), delay);
         }
       }
-    })();
+    };
+
+    void connectStream(0);
 
     return () => {
       closed = true;
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
       const cur = this.tickListeners.get(symbol);
       if (cur) {
         cur.delete(cb);

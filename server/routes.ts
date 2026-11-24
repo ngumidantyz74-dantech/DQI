@@ -1,4 +1,5 @@
 import type { Express, Request, Response } from 'express';
+import WebSocket from 'ws';
 import { z } from 'zod';
 import { serverConfig, isDerivOAuthConfigured } from './config.ts';
 import {
@@ -92,6 +93,7 @@ export function registerApiRoutes(app: Express): void {
       quantAdminConfigured: isQuantAdminConfigured(),
       quantAdminFromEnv: Boolean(serverConfig.quantAdminPasswordHash),
       derivAppId: serverConfig.derivAppId,
+      derivWsUrl: serverConfig.derivPublicWsUrl,
     });
   });
 
@@ -1183,24 +1185,25 @@ export function registerApiRoutes(app: Express): void {
   // ---------------- DERIV OAUTH & CONTROLLED LIVE EXECUTION ----------------
 
   app.get('/api/v1/auth/deriv/status', (_req: Request, res: Response) => {
-    const appId = serverConfig.derivClientId || serverConfig.derivAppId || '1089';
-    const customAppConfigured = Boolean(serverConfig.derivClientId || process.env.DERIV_APP_ID);
+    const appId = serverConfig.derivAppId || '1089';
+    const customAppConfigured = appId !== '1089';
     res.json({
       configured: true,
       customAppConfigured,
       connected: false,
       appId,
       redirectUriConfigured: Boolean(serverConfig.derivRedirectUri),
-      clientIdConfigured: Boolean(serverConfig.derivClientId || process.env.DERIV_APP_ID),
+      clientIdConfigured: customAppConfigured,
       scopes: serverConfig.derivOAuthScopes,
       message: customAppConfigured
         ? `Ready for Deriv OAuth (App ID ${appId}) or direct API Token login.`
-        : 'Ready with default App ID 1089 (use your own Deriv App ID for OAuth redirect or connect directly with a Deriv API Token).',
+        : 'Ready with default App ID 1089 (enter your own App ID or connect directly with a Deriv API Token).',
     });
   });
 
-  app.get('/api/v1/auth/deriv/start', (_req: Request, res: Response) => {
-    const appId = serverConfig.derivClientId || serverConfig.derivAppId || '1089';
+  app.get('/api/v1/auth/deriv/start', (req: Request, res: Response) => {
+    const reqAppId = String(req.query.app_id || '').trim();
+    const appId = /^\d+$/.test(reqAppId) ? reqAppId : serverConfig.derivAppId || '1089';
     const authBase = serverConfig.derivAuthBaseUrl.includes('auth.deriv.com')
       ? 'https://oauth.deriv.com'
       : serverConfig.derivAuthBaseUrl;
@@ -1212,10 +1215,20 @@ export function registerApiRoutes(app: Express): void {
   });
 
   app.get('/api/v1/auth/deriv/callback', async (req: Request, res: Response) => {
+    // Handle Deriv standard multi-account OAuth callback (?acct1=...&token1=...&cur1=...)
+    if (req.query.acct1 && req.query.token1) {
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(req.query)) {
+        if (typeof v === 'string') qs.set(k, v);
+      }
+      res.redirect(`/?${qs.toString()}`);
+      return;
+    }
+
     const code = String(req.query.code || '');
     const state = String(req.query.state || '');
     if (!code || !state) {
-      res.status(400).json({ error: 'INVALID_OAUTH_CALLBACK' });
+      res.redirect('/?oauth_error=Missing+Deriv+OAuth+accounts+in+callback');
       return;
     }
     const txKey = sha256(state);
@@ -1350,5 +1363,135 @@ export function registerApiRoutes(app: Express): void {
       const status = msg.includes('GEMINI_API_KEY') ? 503 : 502;
       res.status(status).json({ error: msg });
     }
+  });
+
+  // ---------------- STATELESS HTTPS -> DERIV WS FALLBACK BRIDGE ----------------
+  // Used automatically when browser WebSocket connections are blocked by mobile carrier/ISP/DNS.
+  app.post('/api/v1/deriv/proxy', async (req: Request, res: Response) => {
+    const parsed = z
+      .object({
+        appId: z.string().regex(/^\d+$/).optional(),
+        token: z.string().min(4).max(256).optional(),
+        payload: z.record(z.string(), z.unknown()),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'INVALID_DERIV_PROXY_REQUEST' });
+      return;
+    }
+
+    const allowedKeys = [
+      'active_symbols',
+      'contracts_for',
+      'ticks_history',
+      'ticks',
+      'proposal',
+      'authorize',
+      'balance',
+      'portfolio',
+      'proposal_open_contract',
+      'buy',
+      'sell',
+      'ping',
+    ];
+    const p = { ...parsed.data.payload };
+    delete p.subscribe; // one-shot HTTP bridge never opens subscriptions
+    const hasAllowedKey = allowedKeys.some((k) => k in p);
+    if (!hasAllowedKey) {
+      res.status(403).json({ error: 'UNSUPPORTED_DERIV_PROXY_METHOD' });
+      return;
+    }
+
+    const appId = parsed.data.appId || serverConfig.derivAppId || '1089';
+    const hosts = Array.from(
+      new Set([
+        serverConfig.derivPublicWsUrl || 'wss://ws.derivws.com/websockets/v3',
+        'wss://ws.derivws.com/websockets/v3',
+        'wss://frontend.derivws.com/websockets/v3',
+        'wss://ws.binaryws.com/websockets/v3',
+      ])
+    );
+
+    const runOneShot = (wsUrl: string): Promise<Record<string, unknown>> =>
+      new Promise((resolve, reject) => {
+        const sep = wsUrl.includes('?') ? '&' : '?';
+        const fullUrl = wsUrl.includes('app_id=') ? wsUrl : `${wsUrl}${sep}app_id=${encodeURIComponent(appId)}`;
+        const ws = new WebSocket(fullUrl, { handshakeTimeout: 5000, perMessageDeflate: false });
+        const timer = setTimeout(() => {
+          try {
+            ws.terminate();
+          } catch {
+            // ignore
+          }
+          reject(new Error('Deriv proxy request timed out'));
+        }, 9000);
+
+        const cleanup = () => clearTimeout(timer);
+        let stage: 'auth' | 'main' = parsed.data.token && !('authorize' in p) ? 'auth' : 'main';
+
+        ws.once('open', () => {
+          if (stage === 'auth') {
+            ws.send(JSON.stringify({ authorize: parsed.data.token, req_id: 1 }));
+          } else {
+            ws.send(JSON.stringify({ ...p, req_id: 2 }));
+          }
+        });
+
+        ws.on('message', (raw) => {
+          let msg: Record<string, unknown>;
+          try {
+            msg = JSON.parse(raw.toString()) as Record<string, unknown>;
+          } catch {
+            return;
+          }
+          const err = msg.error as { message?: string } | undefined;
+          if (err?.message) {
+            cleanup();
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            reject(new Error(err.message));
+            return;
+          }
+          if (stage === 'auth' && msg.req_id === 1) {
+            stage = 'main';
+            ws.send(JSON.stringify({ ...p, req_id: 2 }));
+            return;
+          }
+          if (msg.req_id === 2 || !('req_id' in msg)) {
+            cleanup();
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            resolve(msg);
+          }
+        });
+
+        ws.once('error', (err) => {
+          cleanup();
+          reject(new Error(err.message || 'Deriv proxy WebSocket error'));
+        });
+      });
+
+    let lastErr: Error | null = null;
+    for (const h of hosts) {
+      try {
+        const result = await runOneShot(h);
+        res.json(result);
+        return;
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        // Don't retry other hosts on logical Deriv API rejections (e.g. InvalidToken)
+        if (!/timeout|closed|ECONN|ENOTFOUND|network|Unexpected server response|WebSocket/i.test(lastErr.message)) {
+          res.status(400).json({ error: lastErr.message });
+          return;
+        }
+      }
+    }
+    res.status(502).json({ error: lastErr?.message || 'Unable to reach Deriv servers' });
   });
 }

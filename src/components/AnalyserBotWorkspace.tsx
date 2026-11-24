@@ -104,13 +104,20 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   const loadAnalysis = useCallback(async () => {
     setLoadingData(true);
     setDataError(null);
+    let firstErr: string | null = null;
     try {
       const [digRes, qRes] = await Promise.all([
-        dqiApi.analyzeDigits(selectedSymbol, tickWindow, tradeStake, 1).catch(() => null),
-        dqiApi.analyzeQuant(selectedSymbol, chartTimeframe, 160).catch(() => null),
+        dqiApi.analyzeDigits(selectedSymbol, tickWindow, tradeStake, 1).catch((err) => {
+          firstErr = firstErr || (err instanceof Error ? err.message : String(err));
+          return null;
+        }),
+        dqiApi.analyzeQuant(selectedSymbol, chartTimeframe, 160).catch((err) => {
+          firstErr = firstErr || (err instanceof Error ? err.message : String(err));
+          return null;
+        }),
       ]);
       if (!digRes && !qRes) {
-        throw new Error('Waiting for Deriv public WebSocket response. Tap Refresh to retry.');
+        throw new Error(firstErr || 'Unable to reach Deriv servers. Tap Refresh or set your App ID in Connect Deriv.');
       }
       if (digRes) setDigitsData(digRes);
       if (qRes) setQuantData(qRes);
@@ -120,6 +127,12 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       setLoadingData(false);
     }
   }, [selectedSymbol, tickWindow, chartTimeframe, tradeStake]);
+
+  useEffect(() => {
+    if (latestTick && dataError) {
+      setDataError(null);
+    }
+  }, [latestTick, dataError]);
 
   useEffect(() => {
     setAiBrief(null);

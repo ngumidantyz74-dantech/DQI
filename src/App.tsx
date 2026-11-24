@@ -73,6 +73,7 @@ export default function App() {
   // Quick Deriv Connect Modal
   const [connectOpen, setConnectOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState('');
+  const [appIdInput, setAppIdInput] = useState(() => dqiApi.getDerivSession().appId || '1089');
   const [connectBusy, setConnectBusy] = useState(false);
   const [connectErr, setConnectErr] = useState<string | null>(null);
 
@@ -96,7 +97,11 @@ export default function App() {
     void (async () => {
       try {
         const st = await dqiApi.getSystemStatus();
-        if (st?.derivAppId) dqiApi.setDerivAppId(st.derivAppId);
+        if (st?.derivWsUrl) dqiApi.setDerivWsBaseUrl(st.derivWsUrl);
+        if (st?.derivAppId) {
+          dqiApi.setDerivAppId(st.derivAppId);
+          setAppIdInput(st.derivAppId);
+        }
       } catch {
         // fallback to default app id 1089
       }
@@ -241,7 +246,11 @@ export default function App() {
     setConnectBusy(true);
     setConnectErr(null);
     try {
-      const res = await dqiApi.startDerivOAuth();
+      const cleanId = appIdInput.trim();
+      if (/^\d+$/.test(cleanId)) {
+        dqiApi.setDerivAppId(cleanId, true);
+      }
+      const res = await dqiApi.startDerivOAuth(cleanId);
       window.location.assign(res.authorizationUrl);
     } catch (err) {
       setConnectErr(err instanceof Error ? err.message : 'Could not start Deriv OAuth');
@@ -255,6 +264,10 @@ export default function App() {
     setConnectBusy(true);
     setConnectErr(null);
     try {
+      const cleanId = appIdInput.trim();
+      if (/^\d+$/.test(cleanId)) {
+        dqiApi.setDerivAppId(cleanId, true);
+      }
       const s = await dqiApi.authorizeDerivToken(tokenInput.trim());
       setTokenInput('');
       setConnectOpen(false);
@@ -617,6 +630,25 @@ export default function App() {
               )}
 
               <div>
+                <label className="block font-semibold text-[#20242B] dark:text-white">
+                  Deriv App ID
+                </label>
+                <div className="mt-1 flex gap-2">
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={appIdInput}
+                    onChange={(e) => setAppIdInput(e.target.value)}
+                    placeholder="e.g. 1089 or your App ID"
+                    className="w-36 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-1.5 font-mono text-xs text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                  />
+                  <span className="self-center text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+                    Numeric ID from developers.deriv.com (1089 for quick testing)
+                  </span>
+                </div>
+              </div>
+
+              <div>
                 <div className="font-semibold text-[#20242B] dark:text-white">
                   Option 1 — Instant Connect with Deriv API Token (Fastest)
                 </div>
@@ -646,8 +678,11 @@ export default function App() {
                   Option 2 — Login via Deriv OAuth (Demo + Real Switcher)
                 </div>
                 <p className="mt-1 text-[#6B7280] dark:text-[#9CA3AF]">
-                  Loads all your linked Deriv Demo (VRTC) and Real (CR) accounts together. Uses App ID{' '}
-                  <span className="font-mono font-semibold">{derivSession.appId}</span>.
+                  Loads all your linked Deriv Demo (VRTC) and Real (CR) accounts together. On{' '}
+                  <strong>developers.deriv.com</strong>, make sure <strong>Read + Trade</strong> scopes and this Redirect URL are added:{' '}
+                  <span className="mt-1 block break-all rounded bg-[#F5F7FA] px-2 py-1 font-mono text-[10px] text-[#20242B] dark:bg-[#0F151D] dark:text-[#D1D5DB]">
+                    {typeof window !== 'undefined' ? `${window.location.origin}/api/v1/auth/deriv/callback` : '/api/v1/auth/deriv/callback'}
+                  </span>
                 </p>
                 <button
                   type="button"
@@ -656,7 +691,7 @@ export default function App() {
                   className="mt-2.5 flex w-full items-center justify-center gap-2 rounded-md bg-[#0866FF] px-4 py-2 font-semibold text-white hover:bg-[#0654d4] disabled:opacity-50"
                 >
                   <ExternalLink className="h-3.5 w-3.5" />
-                  Continue with Deriv OAuth
+                  Continue with Deriv OAuth (App {appIdInput.trim() || derivSession.appId})
                 </button>
               </div>
             </div>

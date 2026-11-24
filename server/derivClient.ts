@@ -117,8 +117,12 @@ class DerivPublicService extends EventEmitter {
     const configured = serverConfig.derivPublicWsUrl || 'wss://ws.derivws.com/websockets/v3';
     const defaults = [
       configured,
+      'wss://ws.derivws.com/websockets/v3',
+      'wss://frontend.derivws.com/websockets/v3',
       'wss://green.derivws.com/websockets/v3',
       'wss://blue.derivws.com/websockets/v3',
+      'wss://red.derivws.com/websockets/v3',
+      'wss://ws.binaryws.com/websockets/v3',
     ];
     return Array.from(new Set(defaults));
   }

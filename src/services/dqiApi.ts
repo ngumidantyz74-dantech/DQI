@@ -78,6 +78,7 @@ export const dqiApi = {
       quantAdminConfigured: boolean;
       quantAdminFromEnv: boolean;
       derivAppId: string;
+      derivWsUrl?: string;
     }>('/api/v1/system/status'),
 
   getSymbols: async (_refresh = false) => {
@@ -408,7 +409,10 @@ export const dqiApi = {
       '/api/v1/auth/deriv/status'
     ),
 
-  startDerivOAuth: () => apiFetch<{ authorizationUrl: string; appId?: string }>('/api/v1/auth/deriv/start'),
+  startDerivOAuth: (appId?: string) =>
+    apiFetch<{ authorizationUrl: string; appId?: string }>(
+      `/api/v1/auth/deriv/start${appId && /^\d+$/.test(appId.trim()) ? `?app_id=${encodeURIComponent(appId.trim())}` : ''}`
+    ),
 
   getLiveControl: () =>
     apiFetch<{
@@ -430,7 +434,8 @@ export const dqiApi = {
   resetKillSwitch: () => apiFetch('/api/v1/live/reset-kill-switch', {}),
 
   // Direct Real-Time Deriv Browser Session & Live Execution
-  setDerivAppId: (appId: string) => browserDerivPublic.setAppId(appId),
+  setDerivAppId: (appId: string, persist = false) => browserDerivPublic.setAppId(appId, persist),
+  setDerivWsBaseUrl: (url: string | null | undefined) => browserDerivPublic.setWsBaseUrl(url),
   getDerivSession: (): DerivSessionState => browserDerivPublic.getSessionState(),
   subscribeDerivSession: (cb: (state: DerivSessionState) => void) => browserDerivPublic.subscribeSession(cb),
   authorizeDerivToken: (token: string) => browserDerivPublic.authorizeToken(token),

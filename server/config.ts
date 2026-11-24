@@ -17,31 +17,62 @@ function parseNonNegativeInt(raw: string | undefined, fallback: number): number 
   return Number.isFinite(num) && num >= 0 ? num : fallback;
 }
 
+function cleanEnv(raw: string | undefined): string {
+  return (raw ?? '').trim().replace(/^["']|["']$/g, '');
+}
+
+function resolveDerivAppId(): string {
+  const candidates = [
+    cleanEnv(process.env.DERIV_APP_ID),
+    cleanEnv(process.env.DERIV_CLIENT_ID),
+    cleanEnv(process.env.VITE_DERIV_APP_ID),
+  ];
+  for (const c of candidates) {
+    if (/^\d+$/.test(c)) return c;
+  }
+  return '1089';
+}
+
+function resolveDerivWsUrl(): string {
+  const raw = cleanEnv(process.env.DERIV_PUBLIC_WS_URL);
+  if (!raw) return 'wss://ws.derivws.com/websockets/v3';
+  if (raw.startsWith('wss://') || raw.startsWith('ws://')) return raw;
+  if (raw.startsWith('https://')) return raw.replace(/^https:\/\//, 'wss://');
+  if (raw.startsWith('http://')) return raw.replace(/^http:\/\//, 'ws://');
+  if (raw.includes('.')) return `wss://${raw.replace(/^\/+/, '')}`;
+  return 'wss://ws.derivws.com/websockets/v3';
+}
+
 export const serverConfig = {
   nodeEnv: process.env.NODE_ENV || 'development',
   isProduction: process.env.NODE_ENV === 'production',
   port: parseNonNegativeInt(process.env.PORT, 3000) || 3000,
-  appUrl: process.env.APP_URL || process.env.WEB_ORIGIN || 'http://localhost:3000',
-  allowedOrigins: (process.env.QUANT_ALLOWED_ORIGINS || process.env.WEB_ORIGIN || process.env.APP_URL || 'http://localhost:3000')
+  appUrl: cleanEnv(process.env.APP_URL) || cleanEnv(process.env.WEB_ORIGIN) || 'http://localhost:3000',
+  allowedOrigins: (
+    cleanEnv(process.env.QUANT_ALLOWED_ORIGINS) ||
+    cleanEnv(process.env.WEB_ORIGIN) ||
+    cleanEnv(process.env.APP_URL) ||
+    'http://localhost:3000'
+  )
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
 
-  databaseUrl: process.env.DATABASE_URL || process.env.POSTGRES_URL || '',
+  databaseUrl: cleanEnv(process.env.DATABASE_URL) || cleanEnv(process.env.POSTGRES_URL) || '',
   databaseUrlUnpooled:
-    process.env.DATABASE_URL_UNPOOLED ||
-    process.env.POSTGRES_URL_NON_POOLING ||
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_URL ||
+    cleanEnv(process.env.DATABASE_URL_UNPOOLED) ||
+    cleanEnv(process.env.POSTGRES_URL_NON_POOLING) ||
+    cleanEnv(process.env.DATABASE_URL) ||
+    cleanEnv(process.env.POSTGRES_URL) ||
     '',
 
-  derivClientId: process.env.DERIV_CLIENT_ID || '',
-  derivAppId: process.env.DERIV_APP_ID || process.env.VITE_DERIV_APP_ID || '1089',
-  derivRedirectUri: process.env.DERIV_REDIRECT_URI || '',
-  derivOAuthScopes: process.env.DERIV_OAUTH_SCOPES || 'read trade',
-  derivApiBaseUrl: process.env.DERIV_API_BASE_URL || 'https://api.derivws.com',
-  derivAuthBaseUrl: process.env.DERIV_AUTH_BASE_URL || 'https://oauth.deriv.com',
-  derivPublicWsUrl: process.env.DERIV_PUBLIC_WS_URL || 'wss://ws.derivws.com/websockets/v3',
+  derivClientId: cleanEnv(process.env.DERIV_CLIENT_ID),
+  derivAppId: resolveDerivAppId(),
+  derivRedirectUri: cleanEnv(process.env.DERIV_REDIRECT_URI),
+  derivOAuthScopes: cleanEnv(process.env.DERIV_OAUTH_SCOPES) || 'read trade',
+  derivApiBaseUrl: cleanEnv(process.env.DERIV_API_BASE_URL) || 'https://api.derivws.com',
+  derivAuthBaseUrl: cleanEnv(process.env.DERIV_AUTH_BASE_URL) || 'https://oauth.deriv.com',
+  derivPublicWsUrl: resolveDerivWsUrl(),
 
   sessionSecret: process.env.DQI_SESSION_SECRET || process.env.QUANT_SESSION_SECRET || EPHEMERAL_SESSION_KEY,
   quantAdminPasswordHash: process.env.QUANT_ADMIN_PASSWORD_HASH || '',
