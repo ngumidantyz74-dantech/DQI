@@ -139,10 +139,12 @@ export const dqiApi = {
     }
   },
 
-  analyzeDigits: async (symbol: string, window = 100, stake = 1, duration = 1) => {
+  getBufferedTicks: (symbol: string) => browserDerivPublic.getBufferedTicks(symbol),
+
+  analyzeDigits: async (symbol: string, window = 500, stake = 1, duration = 1) => {
     try {
       const [ticks, contractSupport] = await Promise.all([
-        browserDerivPublic.fetchTickHistory(symbol, Math.max(window, 250)),
+        browserDerivPublic.fetchTickHistory(symbol, Math.max(window, 500)),
         browserDerivPublic.fetchContractsFor(symbol).catch(() => null),
       ]);
       const [matchProp, differProp] = await Promise.all([

@@ -11,6 +11,22 @@ export interface PreloadedStrategyMeta {
 
 export const PRELOADED_STRATEGIES: PreloadedStrategyMeta[] = [
   {
+    id: 'differs-scalper',
+    name: 'DiffersScalper 1s',
+    fileName: 'DiffersScalper_3367f04a.xml',
+    sourcePath: '/assets/aistudio/DiffersScalper_3367f04a.xml',
+    description:
+      'Linear win-streak DIGITDIFF scalper (Volatility 100 1s, +$0.25/win up to 3 steps, $5 TP / $5 SL). Upgraded in DQI with live cold-digit + Markov gating.',
+  },
+  {
+    id: 'matches-scalper',
+    name: 'MatchesScalper 1s',
+    fileName: 'MatchesScalper_bca907ed.xml',
+    sourcePath: '/assets/aistudio/MatchesScalper_bca907ed.xml',
+    description:
+      'Linear win-streak DIGITMATCH scalper (Volatility 100 1s, $0.50 base, +$0.25/win up to 2 steps, $5 TP / $4 SL). Upgraded in DQI with live hot-digit + transition gating.',
+  },
+  {
     id: 'digit-scalper',
     name: 'DigitScalper 1s',
     fileName: 'DigitScalper_3863aef1.xml',

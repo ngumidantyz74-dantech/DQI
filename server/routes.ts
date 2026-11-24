@@ -316,7 +316,19 @@ export function registerApiRoutes(app: Express): void {
       }
       await derivPublic.subscribeSymbol(symbol);
 
-      const support = await derivPublic.getContractsFor(symbol);
+      const support = await derivPublic.getContractsFor(symbol).catch(() => ({
+        symbol,
+        supportedTypes: ['DIGITMATCH', 'DIGITDIFF', 'DIGITOVER', 'DIGITUNDER', 'DIGITEVEN', 'DIGITODD', 'CALL', 'PUT'],
+        supportsDigits: true,
+        supportsMatch: true,
+        supportsDiffer: true,
+        supportsOverUnder: true,
+        supportsEvenOdd: true,
+        supportsRiseFall: true,
+        minDurationTicks: 1,
+        maxDurationTicks: 10,
+        checkedAt: new Date().toISOString(),
+      }));
       const analytics = analyzeDigitStream(symbol, ticks, windowSize);
       const volatility = analyzeTickVolatility(symbol, ticks, Math.min(windowSize, 100));
 

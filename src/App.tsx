@@ -189,7 +189,7 @@ export default function App() {
       },
       onHistory: (ticks) => {
         if (ticks.length > 0) {
-          const ordered = [...ticks].slice(-120);
+          const ordered = [...ticks].slice(-500);
           setLiveTapeBuffer(ordered);
           setLatestTick(ordered[ordered.length - 1]);
           setFeedHealth({ state: 'LIVE', isStale: false, ageSeconds: 0 });
@@ -197,7 +197,7 @@ export default function App() {
       },
       onTick: (tick) => {
         setLatestTick(tick);
-        setLiveTapeBuffer((prev) => [...prev.slice(-119), tick]);
+        setLiveTapeBuffer((prev) => [...prev.slice(-499), tick]);
         setFeedHealth({ state: 'LIVE', isStale: false, ageSeconds: 0 });
       },
       onHealth: (h) => {

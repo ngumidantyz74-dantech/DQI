@@ -278,7 +278,7 @@ export function analyzeDigitStream(symbol: string, ticks: RawTick[], requestedWi
     qualityNote = 'Sample below 50 ticks — wide confidence intervals and Chi-square suppressed.';
   }
 
-  const tape = ordered.slice(-40).map((t) => ({
+  const tape = ordered.slice(-500).map((t) => ({
     digit: t.lastDigit,
     quote: t.rawQuote,
     epoch: t.epoch,

@@ -5,6 +5,7 @@ import {
   BarChart2,
   CheckCircle2,
   Crown,
+  Download,
   Layers,
   Lock,
   Pause,
@@ -18,6 +19,7 @@ import {
   Wallet,
 } from 'lucide-react';
 import { dqiApi } from '../services/dqiApi';
+import type { BotStrategyConfig } from '../types/deriv';
 import type {
   ActiveSymbol,
   DerivSessionState,
@@ -25,6 +27,15 @@ import type {
   LiveDerivContract,
   LiveTickEvent,
 } from '../types/dqi';
+import { loadPreloadedStrategies } from '../utils/preloadedAssets';
+import { serializeConfigToXml } from '../utils/xmlParser';
+import {
+  evaluateLiveDigitSignals,
+  mergeUniqueTicks,
+  runWalkForwardDigitReplay,
+  type RankedSignal,
+  type StrategyFilter,
+} from '../utils/digitSignalEngine';
 
 interface AnalyserBotWorkspaceProps {
   symbols: ActiveSymbol[];
@@ -37,23 +48,8 @@ interface AnalyserBotWorkspaceProps {
   onOpenConnect: () => void;
 }
 
-type StrategyFilter = 'BEST' | 'DIGITMATCH' | 'DIGITDIFF';
+type BotProfile = 'SMART_BEST' | 'DIFFERS_SCALPER' | 'MATCHES_SCALPER';
 type BotMode = 'MANUAL' | 'ASK' | 'AUTO';
-
-interface RankedSignal {
-  symbol: string;
-  symbolLabel: string;
-  contractType: 'DIGITMATCH' | 'DIGITDIFF';
-  digit: number;
-  score: number;
-  strength: 'STRONG' | 'MODERATE' | 'WAIT';
-  observedPct: number;
-  avoidPct: number;
-  lastSeenTicksAgo: number | null;
-  payout: number | null;
-  askPrice: number | null;
-  reason: string;
-}
 
 interface BotTradeRecord {
   contractId: number;
@@ -86,13 +82,13 @@ const CORE_MARKETS: Array<{ code: string; label: string; shortLabel: string }> =
 const ENGINE_STEPS = [
   { id: 0, label: 'Data', icon: BarChart2 },
   { id: 1, label: 'Pattern', icon: Activity },
-  { id: 2, label: 'Transitions', icon: Layers },
-  { id: 3, label: 'Gaps', icon: Timer },
-  { id: 4, label: 'Final', icon: TrendingUp },
+  { id: 2, label: 'Markov', icon: Layers },
+  { id: 3, label: 'Break-Even', icon: Timer },
+  { id: 4, label: 'Gate', icon: TrendingUp },
 ] as const;
 
 const MIN_STAKE_PRESETS = [0.35, 0.5, 1.0];
-const BOT_SETTINGS_KEY = 'dqi_match_differ_bot_v2';
+const BOT_SETTINGS_KEY = 'dqi_match_differ_bot_v3';
 
 function marketNameFor(code: string, symbols: ActiveSymbol[]): string {
   return (
@@ -100,85 +96,6 @@ function marketNameFor(code: string, symbols: ActiveSymbol[]): string {
     CORE_MARKETS.find((m) => m.code === code)?.label ||
     code
   );
-}
-
-function scoreCandidatesFromDigits(
-  symbol: string,
-  symbolLabel: string,
-  res: DigitsFullResponse,
-  filter: StrategyFilter
-): RankedSignal[] {
-  const { analytics, volatility, proposals } = res;
-  const latestDigit = analytics.latestObservedDigit;
-  const volPenalty =
-    volatility.regime === 'EXTREME' ? 12 : volatility.regime === 'HIGH' ? 4 : 0;
-
-  const transitionMap = new Map<number, number>();
-  for (const pair of analytics.transitionHotPairs) {
-    if (latestDigit !== null && pair.from === latestDigit) {
-      transitionMap.set(pair.to, pair.ratePct);
-    }
-  }
-
-  const out: RankedSignal[] = [];
-
-  for (const row of analytics.digits) {
-    const gap = row.lastSeenTicksAgo ?? 10;
-    const transPct = transitionMap.get(row.digit) ?? 10;
-
-    if (filter === 'BEST' || filter === 'DIGITDIFF') {
-      const underAvg = Math.max(-6, 10 - row.percentage);
-      const transPenalty = Math.max(0, transPct - 12) * 1.1;
-      const recentAbsenceBonus = gap >= 8 ? Math.min(8, (gap - 7) * 0.8) : gap <= 1 ? -4 : 0;
-      const rawScore = 62 + underAvg * 4.2 + recentAbsenceBonus - transPenalty - volPenalty;
-      const score = Math.max(15, Math.min(99, Math.round(rawScore)));
-      const strength = score >= 80 ? 'STRONG' : score >= 65 ? 'MODERATE' : 'WAIT';
-      out.push({
-        symbol,
-        symbolLabel,
-        contractType: 'DIGITDIFF',
-        digit: row.digit,
-        score,
-        strength,
-        observedPct: row.percentage,
-        avoidPct: Number((100 - row.percentage).toFixed(1)),
-        lastSeenTicksAgo: row.lastSeenTicksAgo,
-        payout: proposals.differ?.payout ?? null,
-        askPrice: proposals.differ?.askPrice ?? null,
-        reason: `Digit ${row.digit} appeared ${row.percentage.toFixed(1)}% (${(100 - row.percentage).toFixed(1)}% differ rate) · last seen ${gap} ticks ago`,
-      });
-    }
-
-    if (filter === 'BEST' || filter === 'DIGITMATCH') {
-      const overAvg = Math.max(-5, row.percentage - 10);
-      const transBonus = Math.max(0, transPct - 10) * 1.4;
-      const gapCycleBonus = gap >= 6 && gap <= 16 ? 7 : 0;
-      const rawScore = 54 + overAvg * 4.5 + transBonus + gapCycleBonus - volPenalty;
-      const score = Math.max(15, Math.min(99, Math.round(rawScore)));
-      const strength = score >= 80 ? 'STRONG' : score >= 65 ? 'MODERATE' : 'WAIT';
-      out.push({
-        symbol,
-        symbolLabel,
-        contractType: 'DIGITMATCH',
-        digit: row.digit,
-        score,
-        strength,
-        observedPct: row.percentage,
-        avoidPct: Number((100 - row.percentage).toFixed(1)),
-        lastSeenTicksAgo: row.lastSeenTicksAgo,
-        payout: proposals.match?.payout ?? null,
-        askPrice: proposals.match?.askPrice ?? null,
-        reason: `Digit ${row.digit} hit ${row.percentage.toFixed(1)}% in sample · ${
-          transPct > 12
-            ? `Markov lift ${transPct.toFixed(0)}% after ${latestDigit}`
-            : `last seen ${gap} ticks ago`
-        }`,
-      });
-    }
-  }
-
-  out.sort((a, b) => b.score - a.score);
-  return out;
 }
 
 export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
@@ -204,30 +121,45 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     if (Array.isArray(savedCfg.scanMarkets) && savedCfg.scanMarkets.length > 0) {
       return savedCfg.scanMarkets.map(String);
     }
-    return [selectedSymbol || '1HZ15V'];
+    return [selectedSymbol || '1HZ100V'];
   });
 
+  const [botProfile, setBotProfile] = useState<BotProfile>(() =>
+    savedCfg.botProfile === 'DIFFERS_SCALPER' || savedCfg.botProfile === 'MATCHES_SCALPER'
+      ? savedCfg.botProfile
+      : 'SMART_BEST'
+  );
   const [strategyFilter, setStrategyFilter] = useState<StrategyFilter>(() =>
     savedCfg.strategyFilter === 'DIGITMATCH' || savedCfg.strategyFilter === 'DIGITDIFF'
       ? savedCfg.strategyFilter
       : 'BEST'
   );
   const [botMode, setBotMode] = useState<BotMode>('MANUAL');
+  const [strictEdgeGate, setStrictEdgeGate] = useState<boolean>(() =>
+    typeof savedCfg.strictEdgeGate === 'boolean' ? savedCfg.strictEdgeGate : true
+  );
 
-  // Best Match/Differ stake & $10 drawdown protection settings
+  // Stake, 2-win progression & strict TP / SL / $10 Drawdown Protection
   const [minStake, setMinStake] = useState<number>(() =>
     typeof savedCfg.minStake === 'number' && savedCfg.minStake >= 0.35 ? savedCfg.minStake : 0.35
   );
   const [winStepAdd, setWinStepAdd] = useState<number>(() =>
-    typeof savedCfg.winStepAdd === 'number' && savedCfg.winStepAdd >= 0 ? savedCfg.winStepAdd : 0.35
+    typeof savedCfg.winStepAdd === 'number' && savedCfg.winStepAdd >= 0 ? savedCfg.winStepAdd : 0.25
   );
   const [maxStakeCap, setMaxStakeCap] = useState<number>(() =>
-    typeof savedCfg.maxStakeCap === 'number' && savedCfg.maxStakeCap >= 0.35 ? savedCfg.maxStakeCap : 2.0
+    typeof savedCfg.maxStakeCap === 'number' && savedCfg.maxStakeCap >= 0.35 ? savedCfg.maxStakeCap : 1.5
   );
-  const [maxDrawdown] = useState<number>(10.0);
-  const [minScoreThreshold] = useState<number>(() =>
-    typeof savedCfg.minScoreThreshold === 'number' ? savedCfg.minScoreThreshold : 74
+  const [takeProfitTarget, setTakeProfitTarget] = useState<number>(() =>
+    typeof savedCfg.takeProfitTarget === 'number' && savedCfg.takeProfitTarget >= 0.5
+      ? savedCfg.takeProfitTarget
+      : 5.0
   );
+  const [stopLossLimit, setStopLossLimit] = useState<number>(() =>
+    typeof savedCfg.stopLossLimit === 'number' && savedCfg.stopLossLimit >= 0.5
+      ? Math.min(10.0, savedCfg.stopLossLimit)
+      : 4.0
+  );
+  const maxDrawdown = 10.0;
 
   useEffect(() => {
     try {
@@ -235,43 +167,113 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         BOT_SETTINGS_KEY,
         JSON.stringify({
           scanMarkets,
+          botProfile,
           strategyFilter,
+          strictEdgeGate,
           minStake,
           winStepAdd,
           maxStakeCap,
-          minScoreThreshold,
+          takeProfitTarget,
+          stopLossLimit,
         })
       );
     } catch {
       // ignore storage errors
     }
-  }, [scanMarkets, strategyFilter, minStake, winStepAdd, maxStakeCap, minScoreThreshold]);
+  }, [
+    scanMarkets,
+    botProfile,
+    strategyFilter,
+    strictEdgeGate,
+    minStake,
+    winStepAdd,
+    maxStakeCap,
+    takeProfitTarget,
+    stopLossLimit,
+  ]);
 
-  // Live digit feed state for the currently focused symbol
+  // Preloaded XML Bot Strategies (DiffersScalper + MatchesScalper)
+  const [xmlConfigs, setXmlConfigs] = useState<BotStrategyConfig[]>([]);
+  useEffect(() => {
+    void loadPreloadedStrategies()
+      .then((list) => setXmlConfigs(list))
+      .catch(() => undefined);
+  }, []);
+
+  // Live 500-tick server/WS analysis state
   const [digitsData, setDigitsData] = useState<DigitsFullResponse | null>(null);
   const [syncingData, setSyncingData] = useState(false);
   const [dataError, setDataError] = useState<string | null>(null);
 
-  // 5-phase scanner state
+  // 5-phase scanner state & watchlist signals
   const [scanning, setScanning] = useState(false);
   const [scanPhaseIdx, setScanPhaseIdx] = useState<number>(4);
   const [lastAnalysisTime, setLastAnalysisTime] = useState<string | null>(null);
-  const [rankedSignals, setRankedSignals] = useState<RankedSignal[]>([]);
-  const [lockedSignal, setLockedSignal] = useState<RankedSignal | null>(null);
+  const [watchlistSignals, setWatchlistSignals] = useState<RankedSignal[]>([]);
+  const [manualPickedDigit, setManualPickedDigit] = useState<{
+    symbol: string;
+    digit: number;
+    contractType: 'DIGITMATCH' | 'DIGITDIFF';
+  } | null>(null);
   const [askPromptSignal, setAskPromptSignal] = useState<RankedSignal | null>(null);
   const [autoRunning, setAutoRunning] = useState(false);
   const [realAccountOptIn, setRealAccountOptIn] = useState(false);
 
-  // Bot session progress & 2-win streak / min-loss tracker
+  // Bot session progress & anti-loss protection
   const [sessionAccountId, setSessionAccountId] = useState<string | null>(null);
   const [sessionStartBalance, setSessionStartBalance] = useState<number | null>(null);
   const [sessionPeakBalance, setSessionPeakBalance] = useState<number | null>(null);
   const [consecutiveWins, setConsecutiveWins] = useState(0);
+  const [consecutiveLosses, setConsecutiveLosses] = useState(0);
+  const [cooldownUntilMs, setCooldownUntilMs] = useState<number | null>(null);
+  const [cooldownSecLeft, setCooldownSecLeft] = useState<number>(0);
   const [currentStake, setCurrentStake] = useState<number>(minStake);
   const [sessionTrades, setSessionTrades] = useState<BotTradeRecord[]>([]);
   const [tradeBusy, setTradeBusy] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const processedContractsRef = useRef<Set<number>>(new Set());
+
+  // Apply user's uploaded XML bot profile presets cleanly
+  const selectBotProfile = useCallback(
+    (profile: BotProfile) => {
+      setBotProfile(profile);
+      setManualPickedDigit(null);
+      setAskPromptSignal(null);
+      if (profile === 'DIFFERS_SCALPER') {
+        const xml = xmlConfigs.find((x) => x.id === 'differs-scalper');
+        setStrategyFilter('DIGITDIFF');
+        const base = xml ? Math.max(0.35, Math.min(xml.initialStake, 1.0)) : 0.5;
+        const step = xml ? xml.winStep : 0.25;
+        const maxSteps = xml ? xml.maxWinSteps : 3;
+        setMinStake(base);
+        setWinStepAdd(step);
+        setMaxStakeCap(Number((base + step * maxSteps).toFixed(2)));
+        setTakeProfitTarget(xml ? xml.profitThreshold : 5.0);
+        setStopLossLimit(xml ? Math.min(10, xml.lossThreshold) : 5.0);
+        setStatusMessage(
+          'Loaded DiffersScalper XML rules + live cold-digit & Markov safety gate.'
+        );
+      } else if (profile === 'MATCHES_SCALPER') {
+        const xml = xmlConfigs.find((x) => x.id === 'matches-scalper');
+        setStrategyFilter('DIGITMATCH');
+        const base = xml ? Math.max(0.35, xml.initialStake) : 0.5;
+        const step = xml ? xml.winStep : 0.25;
+        const maxSteps = xml ? xml.maxWinSteps : 2;
+        setMinStake(base);
+        setWinStepAdd(step);
+        setMaxStakeCap(Number((base + step * maxSteps).toFixed(2)));
+        setTakeProfitTarget(xml ? xml.profitThreshold : 5.0);
+        setStopLossLimit(xml ? Math.min(10, xml.lossThreshold) : 4.0);
+        setStatusMessage(
+          'Loaded MatchesScalper XML rules + live hot-digit & Markov trigger gate (never trades blindly on Digit 7).'
+        );
+      } else {
+        setStrategyFilter('BEST');
+        setStatusMessage('Smart Best mode: picks whichever of Matches or Differs holds real statistical edge.');
+      }
+    },
+    [xmlConfigs]
+  );
 
   // Sync session start/peak balance when Deriv account connects or switches
   useEffect(() => {
@@ -281,6 +283,8 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       setSessionStartBalance(derivSession.activeBalance);
       setSessionPeakBalance(derivSession.activeBalance);
       setConsecutiveWins(0);
+      setConsecutiveLosses(0);
+      setCooldownUntilMs(null);
       setCurrentStake(minStake);
       setRealAccountOptIn(false);
       setAutoRunning(false);
@@ -298,7 +302,25 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     }
   }, [minStake, consecutiveWins]);
 
-  // Compute live session metrics & $10 drawdown guard
+  // Countdown timer for anti-loss cooldown shield
+  useEffect(() => {
+    if (!cooldownUntilMs) {
+      setCooldownSecLeft(0);
+      return;
+    }
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((cooldownUntilMs - Date.now()) / 1000));
+      setCooldownSecLeft(left);
+      if (left <= 0) {
+        setCooldownUntilMs(null);
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [cooldownUntilMs]);
+
+  // Compute live session metrics, Take Profit, Stop Loss & $10 Drawdown Guard
   const settledTrades = useMemo(
     () => sessionTrades.filter((t) => t.status === 'won' || t.status === 'lost' || t.status === 'sold'),
     [sessionTrades]
@@ -318,23 +340,159 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       : 0;
   const pnlDrawdown = Math.max(0, Number((-sessionRealizedPnl).toFixed(2)));
   const drawdownUsed = Math.max(balanceDrawdown, pnlDrawdown);
-  const drawdownRemaining = Math.max(0, Number((maxDrawdown - drawdownUsed).toFixed(2)));
-  const drawdownLocked = drawdownUsed >= maxDrawdown || drawdownRemaining < 0.35;
+  const effectiveStopCap = Math.min(maxDrawdown, stopLossLimit);
+  const drawdownRemaining = Math.max(0, Number((effectiveStopCap - drawdownUsed).toFixed(2)));
+  const takeProfitHit = sessionRealizedPnl >= takeProfitTarget;
+  const drawdownLocked = drawdownUsed >= effectiveStopCap || drawdownRemaining < 0.35;
+  const sessionHalted = drawdownLocked || takeProfitHit;
 
   const effectiveNextStake = useMemo(() => {
-    if (drawdownLocked) return 0;
+    if (sessionHalted) return 0;
     const capped = Math.min(currentStake, maxStakeCap, drawdownRemaining);
     return Math.max(0.35, Number(capped.toFixed(2)));
-  }, [currentStake, maxStakeCap, drawdownRemaining, drawdownLocked]);
+  }, [currentStake, maxStakeCap, drawdownRemaining, sessionHalted]);
+
+  // Live merged 500-tick stream updated on EVERY single Deriv WebSocket tick
+  const liveMergedTicks = useMemo(() => {
+    const bufTicks = dqiApi.getBufferedTicks(selectedSymbol).map((t) => ({
+      digit: t.lastDigit,
+      quote: t.rawQuote,
+      epoch: t.epoch,
+    }));
+    const analyticsTape = (digitsData?.analytics.tape ?? []).map((t) => ({
+      digit: t.digit,
+      quote: t.quote,
+      epoch: t.epoch,
+    }));
+    const wsTape = liveTapeBuffer.map((t) => ({
+      digit: t.lastDigit,
+      quote: t.rawQuote,
+      epoch: t.epoch,
+    }));
+    return mergeUniqueTicks([...analyticsTape, ...bufTicks], wsTape, 500);
+  }, [selectedSymbol, digitsData, liveTapeBuffer]);
+
+  // Live real-time digit rankings recomputed on EVERY incoming tick!
+  const liveComputedSignals = useMemo(() => {
+    if (liveMergedTicks.length < 30) return [];
+    return evaluateLiveDigitSignals({
+      symbol: selectedSymbol,
+      symbolLabel: marketNameFor(selectedSymbol, symbols),
+      ticks: liveMergedTicks,
+      filter: strategyFilter,
+      volatilityRegime: digitsData?.volatility.regime || 'NORMAL',
+      matchProposal: digitsData?.proposals.match ?? null,
+      differProposal: digitsData?.proposals.differ ?? null,
+    });
+  }, [
+    liveMergedTicks,
+    selectedSymbol,
+    symbols,
+    strategyFilter,
+    digitsData?.volatility.regime,
+    digitsData?.proposals.match,
+    digitsData?.proposals.differ,
+  ]);
+
+  // Combine multi-market scan results (when scanning >1 market) with live tick-by-tick current market signals
+  const rankedSignals = useMemo(() => {
+    if (watchlistSignals.length === 0) return liveComputedSignals;
+    const otherMarkets = watchlistSignals.filter((s) => s.symbol !== selectedSymbol);
+    const combined = [...liveComputedSignals.slice(0, 4), ...otherMarkets];
+    combined.sort((a, b) => {
+      if (a.entryReady !== b.entryReady) return a.entryReady ? -1 : 1;
+      return b.score - a.score;
+    });
+    return combined;
+  }, [watchlistSignals, liveComputedSignals, selectedSymbol]);
+
+  const lockedSignal: RankedSignal | null = useMemo(() => {
+    if (manualPickedDigit && manualPickedDigit.symbol === selectedSymbol) {
+      const exact = liveComputedSignals.find(
+        (s) =>
+          s.digit === manualPickedDigit.digit &&
+          s.contractType === manualPickedDigit.contractType
+      );
+      if (exact) return exact;
+    }
+    return rankedSignals[0] ?? null;
+  }, [manualPickedDigit, selectedSymbol, liveComputedSignals, rankedSignals]);
+
+  // Zero-lookahead replay over the most recent real Deriv ticks (updates every 5 ticks so UI stays silky smooth)
+  const replayBucket = Math.floor(liveMergedTicks.length / 5);
+  const replayProof = useMemo(() => {
+    const targetType: 'DIGITMATCH' | 'DIGITDIFF' =
+      lockedSignal?.contractType ?? (strategyFilter === 'DIGITMATCH' ? 'DIGITMATCH' : 'DIGITDIFF');
+    if (liveMergedTicks.length < 130) return null;
+    return runWalkForwardDigitReplay({
+      symbol: selectedSymbol,
+      symbolLabel: marketNameFor(selectedSymbol, symbols),
+      ticks: liveMergedTicks,
+      contractType: targetType,
+      volatilityRegime: digitsData?.volatility.regime || 'NORMAL',
+      matchProposal: digitsData?.proposals.match ?? null,
+      differProposal: digitsData?.proposals.differ ?? null,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    replayBucket,
+    selectedSymbol,
+    strategyFilter,
+    lockedSignal?.contractType,
+    digitsData?.volatility.regime,
+    digitsData?.proposals.match,
+    digitsData?.proposals.differ,
+  ]);
+
+  useEffect(() => {
+    if (latestTick) {
+      setLastAnalysisTime(new Date().toLocaleTimeString());
+    }
+  }, [latestTick]);
+
+  // Fetch 500-tick baseline + real Deriv Match/Differ proposals when symbol changes
+  const syncSelectedSymbolData = useCallback(async () => {
+    setSyncingData(true);
+    setDataError(null);
+    try {
+      const res = await dqiApi.analyzeDigits(selectedSymbol, 500, effectiveNextStake || minStake, 1);
+      setDigitsData(res);
+      setLastAnalysisTime(new Date().toLocaleTimeString());
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Waiting for Deriv live quotes...');
+    } finally {
+      setSyncingData(false);
+    }
+  }, [selectedSymbol, effectiveNextStake, minStake]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void dqiApi
+      .analyzeDigits(selectedSymbol, 500, minStake, 1)
+      .then((res) => {
+        if (!cancelled) {
+          setDigitsData(res);
+          setDataError(null);
+          setLastAnalysisTime((prev) => prev || new Date().toLocaleTimeString());
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setDataError(err instanceof Error ? err.message : 'Waiting for Deriv live quotes...');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSymbol, minStake]);
 
   const [liveProposal, setLiveProposal] = useState<{ askPrice: number; payout: number } | null>(null);
-
   const activeContractType: 'DIGITMATCH' | 'DIGITDIFF' =
     lockedSignal?.contractType ?? (strategyFilter === 'DIGITMATCH' ? 'DIGITMATCH' : 'DIGITDIFF');
   const activeDigit = lockedSignal?.digit ?? 0;
 
   useEffect(() => {
-    if (drawdownLocked) return;
+    if (sessionHalted) return;
     let cancelled = false;
     void dqiApi
       .getProposal({
@@ -354,100 +512,26 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [lockedSignal?.symbol, selectedSymbol, activeContractType, activeDigit, effectiveNextStake, minStake, drawdownLocked]);
-
-  // Sync live 100-tick history for selected symbol
-  const syncSelectedSymbolData = useCallback(async () => {
-    setSyncingData(true);
-    setDataError(null);
-    try {
-      const res = await dqiApi.analyzeDigits(selectedSymbol, 100, minStake, 1);
-      setDigitsData(res);
-      const ranked = scoreCandidatesFromDigits(
-        selectedSymbol,
-        marketNameFor(selectedSymbol, symbols),
-        res,
-        strategyFilter
-      );
-      if (ranked.length > 0) {
-        setRankedSignals(ranked);
-        setLockedSignal(ranked[0]);
-        setLastAnalysisTime(new Date().toLocaleTimeString());
-      }
-    } catch (err) {
-      setDataError(err instanceof Error ? err.message : 'Waiting for Deriv live quotes...');
-    } finally {
-      setSyncingData(false);
-    }
-  }, [selectedSymbol, minStake, symbols, strategyFilter]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void dqiApi
-      .analyzeDigits(selectedSymbol, 100, minStake, 1)
-      .then((res) => {
-        if (!cancelled) {
-          setDigitsData(res);
-          setDataError(null);
-          const ranked = scoreCandidatesFromDigits(
-            selectedSymbol,
-            marketNameFor(selectedSymbol, symbols),
-            res,
-            strategyFilter
-          );
-          if (ranked.length > 0) {
-            setRankedSignals(ranked);
-            setLockedSignal((prev) => (!prev || prev.symbol !== selectedSymbol ? ranked[0] : prev));
-            setLastAnalysisTime((prev) => prev || new Date().toLocaleTimeString());
-          }
-        }
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          setDataError(err instanceof Error ? err.message : 'Waiting for Deriv live quotes...');
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedSymbol, minStake, strategyFilter, symbols]);
+  }, [lockedSignal?.symbol, selectedSymbol, activeContractType, activeDigit, effectiveNextStake, minStake, sessionHalted]);
 
   const liveDigits = useMemo(() => {
-    const base = (digitsData?.analytics.tape ?? []).map((t) => ({
-      digit: t.digit,
-      quote: t.quote,
-      epoch: t.epoch,
-    }));
-    const live = liveTapeBuffer.map((t) => ({
-      digit: t.lastDigit,
-      quote: t.rawQuote,
-      epoch: t.epoch,
-    }));
-    const seen = new Set<string>();
-    const merged: Array<{ digit: number; quote: string; epoch: number }> = [];
-    for (const item of [...base, ...live]) {
-      const k = `${item.epoch}:${item.quote}`;
-      if (!seen.has(k)) {
-        seen.add(k);
-        merged.push(item);
-      }
-    }
-    const win = merged.slice(-100);
+    const win = liveMergedTicks.slice(-100);
     const counts = new Array<number>(10).fill(0);
     for (const row of win) counts[row.digit] += 1;
     const total = win.length;
     return {
-      total,
+      total100: total,
+      totalAll: liveMergedTicks.length,
       bars: counts.map((c, digit) => ({
         digit,
         count: c,
         pct: total > 0 ? (c / total) * 100 : 0,
       })),
-      tape20: win.slice(-20),
+      tape20: liveMergedTicks.slice(-20),
     };
-  }, [digitsData, liveTapeBuffer]);
+  }, [liveMergedTicks]);
 
-  // Watch liveContracts for settlement -> 2-win stake booster / min-loss reset
+  // Watch liveContracts for settlement -> 2-win stake booster / immediate min-loss reset / loss cooldown
   useEffect(() => {
     if (liveContracts.length === 0) return;
 
@@ -472,13 +556,14 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
 
       processedContractsRef.current.add(live.contractId);
       if (live.profit > 0) {
+        setConsecutiveLosses(0);
         setConsecutiveWins((prevStreak) => {
           const nextStreak = prevStreak + 1;
           if (nextStreak >= 2 && nextStreak % 2 === 0) {
             setCurrentStake((prevStake) => {
               const boosted = Math.min(maxStakeCap, Number((prevStake + winStepAdd).toFixed(2)));
               setStatusMessage(
-                `2 consecutive wins! Stake boosted to $${boosted.toFixed(2)} (+$${winStepAdd.toFixed(2)}).`
+                `2 consecutive wins! Stake stepped up to $${boosted.toFixed(2)} (+$${winStepAdd.toFixed(2)}).`
               );
               return boosted;
             });
@@ -492,14 +577,27 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       } else {
         setConsecutiveWins(0);
         setCurrentStake(minStake);
-        setStatusMessage(
-          `Loss ($${live.profit.toFixed(2)}). Stake reset immediately to minimum $${minStake.toFixed(2)} to avoid $10 drawdown.`
-        );
+        setConsecutiveLosses((prevLosses) => {
+          const nextLosses = prevLosses + 1;
+          const shouldCooldown =
+            tracked.contractType === 'DIGITDIFF' || nextLosses >= 4;
+          if (shouldCooldown) {
+            setCooldownUntilMs(Date.now() + 20_000);
+            setStatusMessage(
+              `Loss ($${live.profit.toFixed(2)}). Stake reset to min $${minStake.toFixed(2)} + 20s protective cooldown active.`
+            );
+          } else {
+            setStatusMessage(
+              `Miss #${nextLosses} ($${live.profit.toFixed(2)}). Stake held at minimum $${minStake.toFixed(2)} to protect balance.`
+            );
+          }
+          return nextLosses;
+        });
       }
     }
   }, [liveContracts, sessionTrades, maxStakeCap, winStepAdd, minStake]);
 
-  // Execute 5-step Deep Analysis ONLY across user's selected scanMarkets
+  // Execute 5-step Deep Analysis across user's chosen scanMarkets ONLY
   const runTargetedScan = useCallback(async (): Promise<RankedSignal | null> => {
     const targets = scanMarkets.length > 0 ? scanMarkets : [selectedSymbol];
     setScanning(true);
@@ -512,20 +610,39 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       for (let idx = 0; idx < targets.length; idx += 1) {
         const sym = targets[idx];
         setScanPhaseIdx(0);
-        const res = await dqiApi.analyzeDigits(sym, 100, effectiveNextStake || minStake, 1);
+        const res = await dqiApi.analyzeDigits(sym, 500, effectiveNextStake || minStake, 1);
         setScanPhaseIdx(1);
-        await new Promise((r) => window.setTimeout(r, 90));
+        await new Promise((r) => window.setTimeout(r, 70));
         setScanPhaseIdx(2);
-        await new Promise((r) => window.setTimeout(r, 90));
+        await new Promise((r) => window.setTimeout(r, 70));
         setScanPhaseIdx(3);
-        const candidates = scoreCandidatesFromDigits(
-          sym,
-          marketNameFor(sym, symbols),
-          res,
-          strategyFilter
+
+        const symTicks = mergeUniqueTicks(
+          dqiApi.getBufferedTicks(sym).map((t) => ({
+            digit: t.lastDigit,
+            quote: t.rawQuote,
+            epoch: t.epoch,
+          })),
+          (res.analytics.tape ?? []).map((t) => ({
+            digit: t.digit,
+            quote: t.quote,
+            epoch: t.epoch,
+          })),
+          500
         );
+
+        const candidates = evaluateLiveDigitSignals({
+          symbol: sym,
+          symbolLabel: marketNameFor(sym, symbols),
+          ticks: symTicks,
+          filter: strategyFilter,
+          volatilityRegime: res.volatility.regime,
+          matchProposal: res.proposals.match,
+          differProposal: res.proposals.differ,
+        });
+
         if (candidates.length > 0) {
-          allRanked.push(...candidates.slice(0, 4));
+          allRanked.push(...candidates.slice(0, 3));
         }
         if (sym === selectedSymbol) {
           setDigitsData(res);
@@ -533,14 +650,16 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       }
 
       setScanPhaseIdx(4);
-      allRanked.sort((a, b) => b.score - a.score);
-      setRankedSignals(allRanked);
+      allRanked.sort((a, b) => {
+        if (a.entryReady !== b.entryReady) return a.entryReady ? -1 : 1;
+        return b.score - a.score;
+      });
+      setWatchlistSignals(allRanked);
 
       const best = allRanked[0] ?? null;
       if (best) {
-        setLockedSignal(best);
         setLastAnalysisTime(new Date().toLocaleTimeString());
-        if (best.symbol !== selectedSymbol) {
+        if (best.symbol !== selectedSymbol && best.entryReady) {
           onSelectSymbol(best.symbol);
         }
       }
@@ -559,9 +678,14 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         onOpenConnect();
         return;
       }
+      if (takeProfitHit) {
+        setAutoRunning(false);
+        setStatusMessage(`Take Profit target (+$${takeProfitTarget.toFixed(2)}) reached! Profit locked.`);
+        return;
+      }
       if (drawdownLocked) {
         setAutoRunning(false);
-        setStatusMessage('Stopped: $10.00 session drawdown limit reached. Reset session to resume.');
+        setStatusMessage(`Stopped: $${effectiveStopCap.toFixed(2)} protection stop reached. Reset session to resume.`);
         return;
       }
       if (!derivSession.activeIsVirtual && !realAccountOptIn) {
@@ -572,7 +696,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       const stakeToUse = effectiveNextStake;
       if (stakeToUse < 0.35 || stakeToUse > drawdownRemaining) {
         setAutoRunning(false);
-        setStatusMessage('Trade blocked to protect your $10.00 drawdown limit.');
+        setStatusMessage('Trade blocked to protect your session stop limit.');
         return;
       }
 
@@ -618,7 +742,10 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     [
       derivSession.connected,
       derivSession.activeIsVirtual,
+      takeProfitHit,
+      takeProfitTarget,
       drawdownLocked,
+      effectiveStopCap,
       realAccountOptIn,
       effectiveNextStake,
       drawdownRemaining,
@@ -628,44 +755,58 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
 
   const hasOpenBotTrade = useMemo(() => sessionTrades.some((t) => t.status === 'open'), [sessionTrades]);
 
+  // Controlled Auto / Ask Bot Loop — ONLY fires on real ENTRY_READY signals when Strict Edge Gate is ON
   useEffect(() => {
     if (!autoRunning) return;
-    if (botMode === 'MANUAL' || drawdownLocked) {
+    if (botMode === 'MANUAL' || sessionHalted) {
       setAutoRunning(false);
       return;
     }
+    if (cooldownSecLeft > 0) return;
     if (botMode === 'ASK' && askPromptSignal) return;
     if (tradeBusy || hasOpenBotTrade || scanning) return;
 
     const timer = window.setTimeout(() => {
       void (async () => {
-        const best = await runTargetedScan();
+        // Use real-time live signals on single-market watchlist, or scan full watchlist if multi-market
+        const best =
+          scanMarkets.length <= 1 && liveComputedSignals.length > 0
+            ? liveComputedSignals[0]
+            : await runTargetedScan();
         if (!best) return;
-        if (best.score < minScoreThreshold) {
+
+        if (strictEdgeGate && !best.entryReady) {
           setStatusMessage(
-            `Scanned ${scanMarkets.join(', ')}: confidence ${best.score}% < ${minScoreThreshold}% threshold. Waiting…`
+            `Standby (${best.symbolLabel}): ${best.contractType === 'DIGITMATCH' ? 'Match' : 'Differ'} ${best.digit} score ${best.score}% — waiting for all 5 statistical checks before entering.`
           );
           return;
         }
+        if (!strictEdgeGate && best.score < 68) {
+          setStatusMessage(`Standby: confidence ${best.score}% below minimum 68% safety floor.`);
+          return;
+        }
+
         if (botMode === 'ASK') {
           setAskPromptSignal(best);
         } else if (botMode === 'AUTO') {
           await executeTradeSignal(best);
         }
       })();
-    }, 3500);
+    }, 1800);
 
     return () => window.clearTimeout(timer);
   }, [
     autoRunning,
     botMode,
-    drawdownLocked,
+    sessionHalted,
+    cooldownSecLeft,
     askPromptSignal,
     tradeBusy,
     hasOpenBotTrade,
     scanning,
-    minScoreThreshold,
-    scanMarkets,
+    scanMarkets.length,
+    liveComputedSignals,
+    strictEdgeGate,
     runTargetedScan,
     executeTradeSignal,
   ]);
@@ -688,12 +829,47 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     setSessionStartBalance(derivSession.activeBalance);
     setSessionPeakBalance(derivSession.activeBalance);
     setConsecutiveWins(0);
+    setConsecutiveLosses(0);
+    setCooldownUntilMs(null);
     setCurrentStake(minStake);
     setSessionTrades([]);
     processedContractsRef.current.clear();
     setAutoRunning(false);
     setAskPromptSignal(null);
-    setStatusMessage('Session reset. Stake back at minimum and $10 drawdown guard cleared.');
+    setStatusMessage('Session reset. Stake back at minimum and protection counters cleared.');
+  };
+
+  // Export user's DiffersScalper or MatchesScalper XML calibrated with the live predicted digit & parameters
+  const handleExportCalibratedXml = () => {
+    const targetType = lockedSignal?.contractType ?? (strategyFilter === 'DIGITMATCH' ? 'DIGITMATCH' : 'DIGITDIFF');
+    const sourceId = targetType === 'DIGITMATCH' ? 'matches-scalper' : 'differs-scalper';
+    const baseXml = xmlConfigs.find((x) => x.id === sourceId) || xmlConfigs[0];
+    if (!baseXml) {
+      setStatusMessage('XML template still loading — please retry in a moment.');
+      return;
+    }
+    const updatedXml = serializeConfigToXml({
+      ...baseXml,
+      symbol: lockedSignal?.symbol || selectedSymbol,
+      purchaseType: targetType,
+      prediction: activeDigit,
+      initialStake: minStake,
+      winStep: winStepAdd,
+      profitThreshold: takeProfitTarget,
+      lossThreshold: stopLossLimit,
+    });
+    const blob = new Blob([updatedXml], { type: 'application/xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${targetType === 'DIGITMATCH' ? 'MatchesScalper' : 'DiffersScalper'}_${selectedSymbol}_Digit${activeDigit}.xml`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    setStatusMessage(
+      `Exported ${targetType === 'DIGITMATCH' ? 'MatchesScalper' : 'DiffersScalper'} XML set to ${selectedSymbol} Digit ${activeDigit}.`
+    );
   };
 
   const displayQuote = latestTick?.rawQuote ?? digitsData?.analytics.latestQuote ?? null;
@@ -701,7 +877,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   const quotePrefix = displayQuote && displayQuote.length > 1 ? displayQuote.slice(0, -1) : '';
   const quoteLastChar = displayQuote ? displayQuote.slice(-1) : '';
 
-  const drawdownPct = Math.min(100, (drawdownUsed / maxDrawdown) * 100);
+  const drawdownPct = Math.min(100, (drawdownUsed / effectiveStopCap) * 100);
   const potentialReturn =
     liveProposal && liveProposal.askPrice > 0
       ? Number((liveProposal.payout - liveProposal.askPrice).toFixed(2))
@@ -717,36 +893,37 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         </div>
       )}
 
-      {/* Main Layout: Left Mirrors the Clean Vertical Analysis Screenshot Flow; Right Holds Bot & Account Progress */}
       <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-12">
-        {/* LEFT COLUMN (7 cols): Market Selector -> 5-Step Analysis Engine -> Centered Prediction Hero -> Market Stats */}
+        {/* LEFT COLUMN (7 cols): Market & XML Bot Selector -> 5-Step Analysis Engine -> Centered Prediction Hero -> Live Confluence & Replay */}
         <div className="space-y-4 lg:col-span-7">
-          {/* 1. MARKET SELECTOR CARD */}
+          {/* 1. MARKET & BOT PROFILE SELECTOR CARD */}
           <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-2">
                 <SlidersHorizontal className="h-4 w-4 text-[#0866FF]" />
                 <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
-                  Market Selector
+                  Market &amp; Bot Selector
                 </h2>
               </div>
 
-              {/* Strategy Segmented Toggle */}
+              {/* Bot Profile Toggle (Smart Best / DiffersScalper XML / MatchesScalper XML) */}
               <div className="flex items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
                 {(
                   [
-                    { id: 'BEST', label: 'Best (M+D)' },
-                    { id: 'DIGITMATCH', label: 'Matches' },
-                    { id: 'DIGITDIFF', label: 'Differs' },
+                    { id: 'SMART_BEST', label: 'Smart Best' },
+                    { id: 'DIFFERS_SCALPER', label: 'DiffersScalper' },
+                    { id: 'MATCHES_SCALPER', label: 'MatchesScalper' },
                   ] as const
                 ).map((opt) => (
                   <button
                     key={opt.id}
                     type="button"
-                    onClick={() => setStrategyFilter(opt.id)}
+                    onClick={() => selectBotProfile(opt.id)}
                     className={`whitespace-nowrap rounded px-2.5 py-1 text-xs font-semibold transition ${
-                      strategyFilter === opt.id
-                        ? 'bg-[#0866FF] text-white'
+                      botProfile === opt.id
+                        ? opt.id === 'MATCHES_SCALPER'
+                          ? 'bg-[#00A88F] text-white'
+                          : 'bg-[#0866FF] text-white'
                         : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
                     }`}
                   >
@@ -763,6 +940,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 value={selectedSymbol}
                 onChange={(e) => {
                   const code = e.target.value;
+                  setManualPickedDigit(null);
                   onSelectSymbol(code);
                   if (!scanMarkets.includes(code)) {
                     setScanMarkets([code]);
@@ -785,7 +963,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </select>
             </div>
 
-            {/* 2 Clean Action Buttons matching Screenshot (Sync Data + Run Deep Analysis) */}
+            {/* Clean Action Buttons */}
             <div className="mt-3 flex flex-wrap items-center gap-2.5">
               <button
                 type="button"
@@ -794,7 +972,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-4 py-2 text-xs font-semibold text-[#20242B] hover:border-[#0866FF] disabled:opacity-50 dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${syncingData ? 'animate-spin text-[#0866FF]' : ''}`} />
-                {syncingData ? 'Syncing…' : 'Sync Data'}
+                {syncingData ? 'Syncing 500t…' : 'Sync 500 Ticks'}
               </button>
 
               <button
@@ -806,9 +984,19 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 <TrendingUp className="h-3.5 w-3.5" />
                 {scanning ? 'Running Deep Analysis…' : 'Run Deep Analysis'}
               </button>
+
+              <button
+                type="button"
+                onClick={handleExportCalibratedXml}
+                className="inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-2 text-xs font-semibold text-[#20242B] hover:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                title="Download DiffersScalper or MatchesScalper XML updated with the live predicted digit"
+              >
+                <Download className="h-3.5 w-3.5 text-[#0866FF]" />
+                Export Live .xml
+              </button>
             </div>
 
-            {/* User-Chosen Bot Scan Watchlist (never scans random markets) */}
+            {/* User-Chosen Bot Scan Watchlist */}
             <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
               <span className="mr-1 text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
                 Scan Watchlist:
@@ -833,33 +1021,49 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
             </div>
           </section>
 
-          {/* 2. 5-STEP ANALYSIS ENGINE STRIP (Mirrors screenshot's 5 horizontal engine blocks) */}
+          {/* 2. 5-STEP LIVE DATA ENGINE STRIP */}
           <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <Activity className="h-4 w-4 text-[#0866FF]" />
                 <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
-                  DQI Analysis Engine
+                  Real-Time Digit Engine ({liveMergedTicks.length} live ticks)
                 </h2>
               </div>
-              <span className="font-mono text-xs font-semibold tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
-                {scanning ? `Phase ${scanPhaseIdx + 1}/5` : lockedSignal ? '5/5 Complete' : 'Ready'}
+              <span
+                className={`rounded px-2 py-0.5 font-mono text-[11px] font-bold ${
+                  lockedSignal?.entryReady
+                    ? 'bg-[#00A88F]/15 text-[#00A88F]'
+                    : lockedSignal?.gateStatus === 'WATCH'
+                    ? 'bg-[#FFAD3A]/15 text-[#FFAD3A]'
+                    : 'bg-[#F5F7FA] text-[#6B7280] dark:bg-[#0F151D] dark:text-[#9CA3AF]'
+                }`}
+              >
+                {scanning
+                  ? `Phase ${scanPhaseIdx + 1}/5`
+                  : lockedSignal?.entryReady
+                  ? 'ENTRY READY'
+                  : lockedSignal?.gateStatus === 'WATCH'
+                  ? 'WATCHING'
+                  : 'WAIT — NO EDGE'}
               </span>
             </div>
 
             <div className="mt-3 grid grid-cols-5 gap-2">
               {ENGINE_STEPS.map((step) => {
                 const Icon = step.icon;
+                const checkRow = lockedSignal?.checks[step.id];
                 const isDone = !scanning && Boolean(lockedSignal);
                 const isCurrent = scanning && scanPhaseIdx === step.id;
-                const isCompletedStep = scanning ? scanPhaseIdx > step.id : isDone;
+                const passedCheck = isDone && checkRow ? checkRow.passed : isDone;
                 return (
                   <div
                     key={step.id}
+                    title={checkRow ? `${checkRow.label}: ${checkRow.detail}` : step.label}
                     className={`flex flex-col items-center justify-center rounded-md border px-2 py-2.5 text-center transition ${
                       isCurrent
                         ? 'border-[#0866FF] bg-[#0866FF] text-white'
-                        : isCompletedStep
+                        : passedCheck
                         ? 'border-[#00A88F]/40 bg-[#00A88F]/10 text-[#00A88F]'
                         : 'border-[#E5E9EF] bg-[#F5F7FA] text-[#6B7280] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#9CA3AF]'
                     }`}
@@ -873,38 +1077,72 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               })}
             </div>
 
-            {/* Completion Summary Line matching screenshot */}
+            {/* 5-Check Statistical Gate Summary */}
+            {lockedSignal && (
+              <div className="mt-3 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                {lockedSignal.checks.map((chk) => (
+                  <div
+                    key={chk.label}
+                    className="flex items-center justify-between rounded bg-[#F5F7FA] px-2.5 py-1.5 text-[11px] dark:bg-[#0F151D]"
+                  >
+                    <span className="flex items-center gap-1.5 font-semibold text-[#20242B] dark:text-[#F3F4F6]">
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          chk.passed ? 'bg-[#00A88F]' : 'bg-[#FFAD3A]'
+                        }`}
+                      />
+                      {chk.label}
+                    </span>
+                    <span className="font-mono tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
+                      {chk.detail}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="mt-3 flex items-center gap-2 text-xs font-medium text-[#20242B] dark:text-[#F3F4F6]">
               <CheckCircle2
                 className={`h-4 w-4 shrink-0 ${
-                  scanning ? 'text-[#0866FF]' : lockedSignal ? 'text-[#00A88F]' : 'text-[#6B7280]'
+                  lockedSignal?.entryReady
+                    ? 'text-[#00A88F]'
+                    : scanning
+                    ? 'text-[#0866FF]'
+                    : 'text-[#FFAD3A]'
                 }`}
               />
               <span>
                 {scanning
                   ? `Scanning ${scanMarkets.join(', ')} — Step ${scanPhaseIdx + 1} of 5…`
                   : lockedSignal
-                  ? `Analysis Complete! Prediction: ${
-                      lockedSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'
-                    } Digit ${lockedSignal.digit} with ${lockedSignal.score}% confidence`
-                  : 'Click Run Deep Analysis to evaluate your chosen market(s).'}
+                  ? lockedSignal.reason
+                  : 'Waiting for 30+ live Deriv ticks to evaluate Matches/Differs edge…'}
               </span>
             </div>
           </section>
 
-          {/* 3. CENTERED PREDICTION HERO CARD (Mirrors PlusPro AI Prediction Card) */}
+          {/* 3. CENTERED PREDICTION HERO CARD */}
           <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="rounded-lg border border-[#E5E9EF] bg-[#F5F7FA] px-5 py-6 text-center dark:border-[#243040] dark:bg-[#0F151D]">
-              <div className="flex justify-center">
+              <div className="flex items-center justify-center gap-2">
                 <Crown
-                  className={`h-7 w-7 ${
+                  className={`h-6 w-6 ${
                     activeContractType === 'DIGITMATCH' ? 'text-[#00A88F]' : 'text-[#0866FF]'
                   }`}
                 />
+                <span
+                  className={`rounded px-2 py-0.5 font-mono text-[11px] font-bold ${
+                    lockedSignal?.entryReady
+                      ? 'bg-[#00A88F] text-white'
+                      : 'bg-[#FFAD3A]/20 text-[#B45309] dark:text-[#FFAD3A]'
+                  }`}
+                >
+                  {lockedSignal?.entryReady ? '5/5 EDGE CONFIRMED' : 'WAIT — PROTECTING CAPITAL'}
+                </span>
               </div>
 
               <div className="mt-2 text-sm font-bold text-[#20242B] dark:text-white">
-                DQI Signal Prediction ·{' '}
+                DQI Live Prediction ·{' '}
                 <span
                   className={
                     activeContractType === 'DIGITMATCH' ? 'text-[#00A88F]' : 'text-[#0866FF]'
@@ -914,17 +1152,15 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 </span>
               </div>
 
-              {/* Giant Centered Predicted Digit */}
               <div className="mt-3 font-mono text-6xl font-bold leading-none tabular-nums text-[#20242B] dark:text-white">
                 {lockedSignal ? lockedSignal.digit : '—'}
               </div>
 
-              {/* Confidence Progress Bar */}
               <div className="mx-auto mt-4 max-w-sm">
                 <div className="h-2.5 overflow-hidden rounded-full bg-[#E5E9EF] dark:bg-[#243040]">
                   <div
                     className={`h-full transition-all duration-300 ${
-                      confidencePct >= 80
+                      lockedSignal?.entryReady
                         ? 'bg-[#00A88F]'
                         : confidencePct >= 65
                         ? 'bg-[#0866FF]'
@@ -935,24 +1171,59 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 </div>
               </div>
 
-              <div className="mt-3 text-sm font-bold tabular-nums text-[#20242B] dark:text-white">
-                Confidence: {lockedSignal ? `${confidencePct}%` : '—'}
+              <div className="mt-3 flex flex-wrap items-center justify-center gap-3 font-mono text-xs font-bold tabular-nums text-[#20242B] dark:text-white">
+                <span>Score: {lockedSignal ? `${confidencePct}%` : '—'}</span>
+                <span>·</span>
+                <span>
+                  Edge vs Break-Even:{' '}
+                  <span
+                    className={
+                      lockedSignal && lockedSignal.edgePct >= 1.5
+                        ? 'text-[#00A88F]'
+                        : 'text-[#FFAD3A]'
+                    }
+                  >
+                    {lockedSignal
+                      ? `${lockedSignal.edgePct >= 0 ? '+' : ''}${lockedSignal.edgePct.toFixed(1)}%`
+                      : '—'}
+                  </span>
+                </span>
               </div>
 
-              <div className="mt-1 font-mono text-xs tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
-                Last Analysis: {lastAnalysisTime || 'Pending'}
-                {lockedSignal ? ` · ${lockedSignal.symbolLabel}` : ''}
+              <div className="mt-1 font-mono text-[11px] tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
+                Updated: {lastAnalysisTime || 'Streaming…'}
+                {lockedSignal ? ` · ${lockedSignal.symbolLabel} (${lockedSignal.sampleCount} ticks)` : ''}
               </div>
 
-              {lockedSignal && (
-                <div className="mt-2 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                  {lockedSignal.reason}
+              {/* Zero-Lookahead 120-Tick Real Replay Verification */}
+              {replayProof && (
+                <div className="mx-auto mt-3 max-w-md rounded border border-[#E5E9EF] bg-white px-3 py-2 text-[11px] dark:border-[#243040] dark:bg-[#151D27]">
+                  <div className="flex flex-wrap items-center justify-between gap-2 font-mono tabular-nums">
+                    <span className="font-sans font-semibold text-[#6B7280] dark:text-[#9CA3AF]">
+                      Real 120-Tick Walk-Forward Proof:
+                    </span>
+                    <span className="text-[#20242B] dark:text-white">
+                      {replayProof.signalsTriggered > 0
+                        ? `${replayProof.wins}W/${replayProof.losses}L (${replayProof.winRatePct}%)`
+                        : '0 gated entries (strict filter skipped chop)'}
+                    </span>
+                    {replayProof.signalsTriggered > 0 && (
+                      <strong
+                        className={
+                          replayProof.netPnlPerDollar >= 0 ? 'text-[#00A88F]' : 'text-[#FF4D5A]'
+                        }
+                      >
+                        {replayProof.netPnlPerDollar >= 0 ? '+' : ''}$
+                        {replayProof.netPnlPerDollar.toFixed(2)} / $1
+                      </strong>
+                    )}
+                  </div>
                 </div>
               )}
 
-              {/* Quick Top-3 Signal Switcher when scan evaluated multiple picks */}
+              {/* Quick Top-3 Signal Switcher */}
               {rankedSignals.length > 1 && !scanning && (
-                <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
                   {rankedSignals.slice(0, 3).map((cand) => {
                     const isPicked =
                       lockedSignal?.symbol === cand.symbol &&
@@ -963,7 +1234,11 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                         key={`${cand.symbol}-${cand.contractType}-${cand.digit}`}
                         type="button"
                         onClick={() => {
-                          setLockedSignal(cand);
+                          setManualPickedDigit({
+                            symbol: cand.symbol,
+                            digit: cand.digit,
+                            contractType: cand.contractType,
+                          });
                           if (cand.symbol !== selectedSymbol) onSelectSymbol(cand.symbol);
                         }}
                         className={`rounded px-2.5 py-1 font-mono text-[11px] font-semibold tabular-nums transition ${
@@ -973,6 +1248,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                         }`}
                       >
                         {cand.contractType === 'DIGITMATCH' ? 'MATCH' : 'DIFF'} {cand.digit} ({cand.score}%)
+                        {cand.entryReady ? ' ✓' : ''}
                       </button>
                     );
                   })}
@@ -985,7 +1261,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                    {marketNameFor(selectedSymbol, symbols)} · Live Tick ({liveDigits.total} ticks)
+                    {marketNameFor(selectedSymbol, symbols)} · Live Tick (100t window / {liveDigits.totalAll}t total)
                   </div>
                   <div className="mt-0.5 font-mono text-2xl font-bold tabular-nums text-[#20242B] dark:text-white">
                     {displayQuote ? (
@@ -1009,7 +1285,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                     </div>
                   </div>
                   <div>
-                    <div className="font-sans text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Speed</div>
+                    <div className="font-sans text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Regime</div>
                     <div className="font-bold text-[#20242B] dark:text-white">
                       {digitsData?.volatility.regime || 'LIVE'}
                     </div>
@@ -1030,19 +1306,10 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                       onClick={() => {
                         const modeType: 'DIGITMATCH' | 'DIGITDIFF' =
                           strategyFilter === 'DIGITMATCH' ? 'DIGITMATCH' : 'DIGITDIFF';
-                        setLockedSignal({
+                        setManualPickedDigit({
                           symbol: selectedSymbol,
-                          symbolLabel: marketNameFor(selectedSymbol, symbols),
-                          contractType: lockedSignal?.contractType || modeType,
                           digit: bar.digit,
-                          score: lockedSignal?.score ?? 75,
-                          strength: 'MODERATE',
-                          observedPct: bar.pct,
-                          avoidPct: Number((100 - bar.pct).toFixed(1)),
-                          lastSeenTicksAgo: null,
-                          payout: liveProposal?.payout ?? null,
-                          askPrice: liveProposal?.askPrice ?? null,
-                          reason: `Manual digit ${bar.digit} selected (${bar.pct.toFixed(1)}% in last ${liveDigits.total} ticks)`,
+                          contractType: lockedSignal?.contractType || modeType,
                         });
                       }}
                       className={`flex flex-col items-center rounded-md border p-1 transition ${
@@ -1100,7 +1367,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               )}
             </div>
 
-            {/* 4. CURRENT MARKET STATS FOOTER LINE (Mirrors bottom of screenshot) */}
+            {/* 4. CURRENT MARKET STATS FOOTER LINE */}
             <div className="mt-4 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
               <div className="flex items-center gap-1.5 text-xs font-bold text-[#0866FF]">
                 <BarChart2 className="h-3.5 w-3.5" />
@@ -1109,15 +1376,16 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               <div className="mt-1 font-mono text-xs tabular-nums text-[#20242B] dark:text-[#F3F4F6]">
                 Predicted Digit: <strong>{lockedSignal ? lockedSignal.digit : '—'}</strong> | Confidence:{' '}
                 <strong>{lockedSignal ? `${confidencePct}%` : '—'}</strong> | Latest Tick:{' '}
-                <strong>{displayDigit !== null ? displayDigit : '—'}</strong>
+                <strong>{displayDigit !== null ? displayDigit : '—'}</strong> |{' '}
+                {lockedSignal ? `Break-Even: ${lockedSignal.breakEvenPct}%` : ''}
               </div>
             </div>
           </section>
         </div>
 
-        {/* RIGHT COLUMN (5 cols): Account Progress + $10 Drawdown Guard + Controlled Match/Differ Bot */}
+        {/* RIGHT COLUMN (5 cols): Account Progress + Protection Guard + Controlled Match/Differ Bot */}
         <div className="space-y-4 lg:col-span-5">
-          {/* Account Progress & $10.00 Drawdown Protection */}
+          {/* Account Progress & Strict Loss/Profit Guard */}
           <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between gap-2">
               <div>
@@ -1165,15 +1433,15 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </div>
             </div>
 
-            {/* $10.00 Drawdown Safety Meter */}
+            {/* Drawdown & Take Profit Safety Meter */}
             <div className="mt-3">
               <div className="flex items-center justify-between text-xs">
                 <span className="flex items-center gap-1 font-semibold text-[#20242B] dark:text-[#F3F4F6]">
                   <ShieldCheck className="h-3.5 w-3.5 text-[#00A88F]" />
-                  $10.00 Drawdown Protection
+                  Loss Guard (${effectiveStopCap.toFixed(2)} Max Stop)
                 </span>
                 <span className="font-mono text-xs font-bold tabular-nums text-[#20242B] dark:text-white">
-                  ${drawdownUsed.toFixed(2)} / ${maxDrawdown.toFixed(2)}
+                  ${drawdownUsed.toFixed(2)} / ${effectiveStopCap.toFixed(2)}
                 </span>
               </div>
               <div className="mt-1.5 h-2 overflow-hidden rounded bg-[#E5E9EF] dark:bg-[#243040]">
@@ -1191,7 +1459,8 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               <div className="mt-1 flex justify-between text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
                 <span>Safe buffer left: ${drawdownRemaining.toFixed(2)}</span>
                 <span>
-                  Start: {sessionStartBalance !== null ? `$${sessionStartBalance.toFixed(2)}` : '—'}
+                  TP Target: +${takeProfitTarget.toFixed(2)} · Start:{' '}
+                  {sessionStartBalance !== null ? `$${sessionStartBalance.toFixed(2)}` : '—'}
                 </span>
               </div>
             </div>
@@ -1208,7 +1477,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </span>
             </div>
 
-            {/* Bot Execution Mode Switch (Manual / Ask Me / Auto Bot) */}
+            {/* Bot Execution Mode Switch */}
             <div className="mt-3 flex items-center justify-between gap-2">
               <div className="flex flex-1 items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
                 {(
@@ -1242,7 +1511,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               {botMode !== 'MANUAL' && (
                 <button
                   type="button"
-                  disabled={drawdownLocked}
+                  disabled={sessionHalted}
                   onClick={() => {
                     if (autoRunning) {
                       setAutoRunning(false);
@@ -1263,7 +1532,25 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               )}
             </div>
 
-            {/* 3 Clean Stake & Protection Inputs */}
+            {/* Strict Edge Gate Toggle (Prevents Blind Every-Tick Trading) */}
+            <label className="mt-3 flex cursor-pointer items-center justify-between rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-2 text-xs dark:border-[#243040] dark:bg-[#0F151D]">
+              <div>
+                <div className="font-semibold text-[#20242B] dark:text-white">
+                  Strict Edge Gate (Wait on Weak Data)
+                </div>
+                <div className="text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+                  Only auto-enters when all 5 live checks beat break-even
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={strictEdgeGate}
+                onChange={(e) => setStrictEdgeGate(e.target.checked)}
+                className="h-4 w-4 accent-[#00A88F]"
+              />
+            </label>
+
+            {/* Stake & Protection Inputs */}
             <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
               <div>
                 <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
@@ -1318,15 +1605,61 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </div>
             </div>
 
-            <div className="mt-2 text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-              Win 2x consecutively → adds +${winStepAdd.toFixed(2)} · Loss → resets to ${minStake.toFixed(2)} min stake.
+            <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+              <div>
+                <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                  Take Profit ($)
+                </label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min={0.5}
+                  max={100}
+                  value={takeProfitTarget}
+                  onChange={(e) => setTakeProfitTarget(Math.max(0.5, Number(e.target.value)))}
+                  className="mt-1 w-full rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 font-mono text-xs tabular-nums text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                  Stop Loss ($ · max $10)
+                </label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min={0.5}
+                  max={10}
+                  value={stopLossLimit}
+                  onChange={(e) => setStopLossLimit(Math.min(10, Math.max(0.5, Number(e.target.value))))}
+                  className="mt-1 w-full rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 font-mono text-xs tabular-nums text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                />
+              </div>
             </div>
 
+            <div className="mt-2 text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+              Win 2x in a row → +${winStepAdd.toFixed(2)} · Loss → resets to ${minStake.toFixed(2)} + protective cooldown.
+            </div>
+
+            {cooldownSecLeft > 0 && (
+              <div className="mt-3 flex items-center justify-between rounded-md border border-[#FFAD3A]/50 bg-[#FFAD3A]/10 px-3 py-2 text-xs text-[#B45309] dark:text-[#FFAD3A]">
+                <span className="font-semibold">
+                  Protective Cooldown Active ({cooldownSecLeft}s)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCooldownUntilMs(null)}
+                  className="font-bold underline"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+
             {/* Ask-Me Confirmation Banner */}
-            {askPromptSignal && !drawdownLocked && (
+            {askPromptSignal && !sessionHalted && (
               <div className="mt-3 rounded-md border border-[#0866FF] bg-[#0866FF]/10 p-3 text-xs">
                 <div className="font-bold text-[#20242B] dark:text-white">
-                  Signal Ready: {askPromptSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit{' '}
+                  Confirmed Signal: {askPromptSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit{' '}
                   {askPromptSignal.digit} on {askPromptSignal.symbolLabel} ({askPromptSignal.score}%)
                 </div>
                 <div className="mt-2 flex gap-2">
@@ -1350,7 +1683,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
             )}
 
             {/* Live Deriv Payout Preview */}
-            {liveProposal && !drawdownLocked && (
+            {liveProposal && !sessionHalted && (
               <div className="mt-3 flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 font-mono text-xs tabular-nums dark:bg-[#0F151D]">
                 <span className="text-[#6B7280] dark:text-[#9CA3AF]">
                   Payout: <strong className="text-[#20242B] dark:text-white">${liveProposal.payout.toFixed(2)}</strong>
@@ -1388,11 +1721,25 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                   <Wallet className="h-4 w-4" />
                   Connect Deriv to Trade
                 </button>
+              ) : takeProfitHit ? (
+                <div className="flex items-center justify-between gap-2 rounded-md border border-[#00A88F] bg-[#00A88F]/10 px-3 py-2.5 text-xs text-[#00A88F]">
+                  <span className="flex items-center gap-1.5 font-bold">
+                    <CheckCircle2 className="h-4 w-4" />
+                    Take Profit (+${takeProfitTarget.toFixed(2)}) Locked
+                  </span>
+                  <button
+                    type="button"
+                    onClick={resetSessionProgress}
+                    className="rounded bg-[#00A88F] px-2.5 py-1 font-bold text-white"
+                  >
+                    New Session
+                  </button>
+                </div>
               ) : drawdownLocked ? (
                 <div className="flex items-center justify-between gap-2 rounded-md border border-[#FF444F] bg-[#FF444F]/10 px-3 py-2.5 text-xs text-[#FF444F]">
                   <span className="flex items-center gap-1.5 font-bold">
                     <Lock className="h-4 w-4" />
-                    $10.00 Drawdown Stop Active
+                    ${effectiveStopCap.toFixed(2)} Protection Stop Active
                   </span>
                   <button
                     type="button"
@@ -1409,21 +1756,28 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                   onClick={() => lockedSignal && void executeTradeSignal(lockedSignal)}
                   className={`flex w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-xs font-bold text-white disabled:opacity-50 ${
                     derivSession.activeIsVirtual
-                      ? 'bg-[#00A88F] hover:bg-[#00917b]'
+                      ? lockedSignal?.entryReady
+                        ? 'bg-[#00A88F] hover:bg-[#00917b]'
+                        : 'bg-[#0866FF] hover:bg-[#0654d4]'
                       : 'bg-[#FF444F] hover:bg-[#e53843]'
                   }`}
                 >
                   <Play className="h-3.5 w-3.5" />
                   {tradeBusy
                     ? 'Placing Trade…'
-                    : `Place ${activeContractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit ${activeDigit} · $${effectiveNextStake.toFixed(2)}`}
+                    : lockedSignal?.entryReady
+                    ? `Place ${activeContractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit ${activeDigit} · $${effectiveNextStake.toFixed(2)}`
+                    : `Manual Entry (No Edge Yet): ${activeContractType === 'DIGITMATCH' ? 'Match' : 'Differ'} ${activeDigit} · $${effectiveNextStake.toFixed(2)}`}
                 </button>
               )}
             </div>
 
             {statusMessage && (
               <div className="mt-2.5 flex items-start gap-2 rounded bg-[#F5F7FA] px-3 py-2 text-xs text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]">
-                {statusMessage.includes('Loss') || statusMessage.includes('Stopped') ? (
+                {statusMessage.includes('Loss') ||
+                statusMessage.includes('Stopped') ||
+                statusMessage.includes('Miss') ||
+                statusMessage.includes('Standby') ? (
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#FFAD3A]" />
                 ) : (
                   <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#00A88F]" />

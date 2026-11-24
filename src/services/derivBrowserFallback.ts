@@ -1310,6 +1310,10 @@ class BrowserDerivClient {
     };
   }
 
+  public getBufferedTicks(symbol: string): LiveTickEvent[] {
+    return [...(this.tickBuffers.get(symbol) ?? [])];
+  }
+
   subscribeTicks(
     symbol: string,
     handlers: {
@@ -1356,7 +1360,7 @@ class BrowserDerivClient {
               typeof t.pip_size === 'number' ? t.pip_size : this.pipSizeBySymbol.get(symbol) ?? 2;
             this.pipSizeBySymbol.set(symbol, pipSize);
             const parsed = extractLastDigitFromQuote(t.quote, pipSize);
-            handlers.onTick?.({
+            const evt: LiveTickEvent = {
               symbol,
               epoch: t.epoch,
               rawQuote: parsed.rawQuote,
@@ -1365,7 +1369,13 @@ class BrowserDerivClient {
               lastDigit: parsed.lastDigit,
               receivedAt: new Date(t.epoch * 1000).toISOString(),
               source: 'DERIV_PROXY_LIVE',
-            });
+            };
+            const buf = this.tickBuffers.get(symbol) ?? [];
+            buf.push(evt);
+            if (buf.length > 1000) buf.splice(0, buf.length - 1000);
+            this.tickBuffers.set(symbol, buf);
+
+            handlers.onTick?.(evt);
             handlers.onHealth?.({ connectionState: 'LIVE', isStale: false, ageSeconds: 0 });
           }
         } catch {
@@ -1377,7 +1387,7 @@ class BrowserDerivClient {
     const connectStream = async (attempt = 0) => {
       if (closed) return;
       try {
-        const history = await this.fetchTickHistory(symbol, 120);
+        const history = await this.fetchTickHistory(symbol, 500);
         if (closed) return;
         if (history.length > 0) {
           lastEpochSent = history[history.length - 1].epoch;
