@@ -787,54 +787,8 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
 
   const hasOpenBotTrade = useMemo(() => sessionTrades.some((t) => t.status === 'open'), [sessionTrades]);
 
-  // Controlled Auto / Ask Bot Loop — honors burst cap, loss-streak stop, and sample filter
-  useEffect(() => {
-    if (!autoRunning) return;
-    if (botMode === 'MANUAL' || sessionHalted) {
-      setAutoRunning(false);
-      return;
-    }
-    if (burstMaxTrades > 0 && burstTradesCompleted >= burstMaxTrades) {
-      setAutoRunning(false);
-      setAskPromptSignal(null);
-      setStatusMessage(
-        `Burst cap reached (${burstTradesCompleted}/${burstMaxTrades} trades). Review P&L before starting another burst.`
-      );
-      return;
-    }
-    if (cooldownSecLeft > 0) return;
-    if (botMode === 'ASK' && askPromptSignal) return;
-    if (tradeBusy || hasOpenBotTrade || scanning) return;
-
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        const best =
-          scanMarkets.length <= 1 && liveComputedSignals.length > 0
-            ? liveComputedSignals[0]
-            : await runTargetedScan();
-        if (!best) return;
-
-        if (strictEdgeGate && !best.entryReady) {
-          setStatusMessage(
-            `Standby (${best.symbolLabel}): ${best.contractType === 'DIGITMATCH' ? 'Match' : 'Differ'} ${best.digit} (${best.score}/100 index) — waiting for all 5 sample filters.`
-          );
-          return;
-        }
-        if (!strictEdgeGate && best.score < 58) {
-          setStatusMessage(`Standby: sample fit ${best.score}/100 below 58 safety floor.`);
-          return;
-        }
-
-        if (botMode === 'ASK') {
-          setAskPromptSignal(best);
-        } else if (botMode === 'AUTO') {
-          await executeTradeSignal(best);
-        }
-      })();
-    }, 1800);
-
-    return () => window.clearTimeout(timer);
-  }, [
+  // Keep latest state in refs so incoming 1-second WebSocket ticks NEVER cancel the auto-bot timer
+  const botLoopStateRef = useRef({
     autoRunning,
     botMode,
     sessionHalted,
@@ -845,12 +799,98 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     tradeBusy,
     hasOpenBotTrade,
     scanning,
-    scanMarkets.length,
+    scanMarketsLength: scanMarkets.length,
     liveComputedSignals,
     strictEdgeGate,
     runTargetedScan,
     executeTradeSignal,
-  ]);
+  });
+  botLoopStateRef.current = {
+    autoRunning,
+    botMode,
+    sessionHalted,
+    burstMaxTrades,
+    burstTradesCompleted,
+    cooldownSecLeft,
+    askPromptSignal,
+    tradeBusy,
+    hasOpenBotTrade,
+    scanning,
+    scanMarketsLength: scanMarkets.length,
+    liveComputedSignals,
+    strictEdgeGate,
+    runTargetedScan,
+    executeTradeSignal,
+  };
+  const loopBusyRef = useRef(false);
+
+  // Controlled Auto / Ask Bot Loop — runs reliably every 1.4s without getting cancelled by 1s ticks
+  useEffect(() => {
+    if (!autoRunning) return;
+    if (botMode === 'MANUAL' || sessionHalted) {
+      setAutoRunning(false);
+      return;
+    }
+
+    const tickLoop = async () => {
+      const st = botLoopStateRef.current;
+      if (!st.autoRunning || st.botMode === 'MANUAL' || st.sessionHalted) return;
+      if (st.burstMaxTrades > 0 && st.burstTradesCompleted >= st.burstMaxTrades) {
+        setAutoRunning(false);
+        setAskPromptSignal(null);
+        setStatusMessage(
+          `Burst cap reached (${st.burstTradesCompleted}/${st.burstMaxTrades} trades). Review P&L before starting another burst.`
+        );
+        return;
+      }
+      if (st.cooldownSecLeft > 0 || (st.botMode === 'ASK' && st.askPromptSignal)) return;
+      if (st.tradeBusy || st.hasOpenBotTrade || st.scanning || loopBusyRef.current) return;
+
+      loopBusyRef.current = true;
+      try {
+        const best =
+          st.scanMarketsLength <= 1 && st.liveComputedSignals.length > 0
+            ? st.liveComputedSignals[0]
+            : await st.runTargetedScan();
+        if (!best) {
+          setStatusMessage('Waiting for live Deriv tick history (need 30+ ticks)…');
+          return;
+        }
+
+        if (st.strictEdgeGate && !best.entryReady) {
+          const passed = best.checks.filter((c) => c.passed).length;
+          setStatusMessage(
+            `Auto Standby (${best.symbolLabel}): ${best.contractType === 'DIGITMATCH' ? 'Match' : 'Differ'} ${best.digit} has ${passed}/5 filters — waiting for entry (or uncheck Strict Edge Gate to enter now).`
+          );
+          return;
+        }
+        if (!st.strictEdgeGate && best.score < 50) {
+          setStatusMessage(`Auto Standby: sample fit ${best.score}/100 below 50 safety floor.`);
+          return;
+        }
+
+        if (st.botMode === 'ASK') {
+          setAskPromptSignal(best);
+        } else if (st.botMode === 'AUTO') {
+          await st.executeTradeSignal(best);
+        }
+      } finally {
+        loopBusyRef.current = false;
+      }
+    };
+
+    const initTimer = window.setTimeout(() => {
+      void tickLoop();
+    }, 350);
+    const intervalId = window.setInterval(() => {
+      void tickLoop();
+    }, 1500);
+
+    return () => {
+      window.clearTimeout(initTimer);
+      window.clearInterval(intervalId);
+    };
+  }, [autoRunning, botMode, sessionHalted]);
 
   const toggleMarketInWatchlist = (code: string) => {
     setScanMarkets((prev) => {
@@ -1569,13 +1609,15 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                   onClick={() => {
                     if (autoRunning) {
                       setAutoRunning(false);
+                      setStatusMessage('Auto Bot stopped.');
                     } else {
                       if (burstMaxTrades > 0 && burstTradesCompleted >= burstMaxTrades) {
                         setBurstTradesCompleted(0);
                       }
                       setConsecutiveLosses(0);
+                      setCooldownUntilMs(null);
                       setAutoRunning(true);
-                      void runTargetedScan();
+                      setStatusMessage('Auto Bot started — checking live signal…');
                     }
                   }}
                   className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3.5 py-1.5 text-xs font-bold text-white disabled:opacity-50 ${
@@ -1589,6 +1631,12 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 </button>
               )}
             </div>
+
+            {autoRunning && statusMessage && (
+              <div className="mt-2 rounded-md border border-[#0866FF]/30 bg-[#0866FF]/10 px-3 py-1.5 text-[11px] font-medium text-[#20242B] dark:text-[#F3F4F6]">
+                {statusMessage}
+              </div>
+            )}
 
             {/* Anti-Runaway Burst Cap & Stop on Loss Streak */}
             <div className="mt-2.5 grid grid-cols-2 gap-2 text-xs">

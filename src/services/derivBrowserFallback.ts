@@ -1041,9 +1041,8 @@ class BrowserDerivClient {
           contract_id: buy.contract_id,
           subscribe: 1,
         }).catch(() => {});
-      } else {
-        this.ensureContractProxyPolling();
       }
+      this.ensureContractProxyPolling();
 
       return initialContract;
     }
@@ -1129,36 +1128,50 @@ class BrowserDerivClient {
   private ensureContractProxyPolling(): void {
     if (this.contractPollTimer !== null) return;
     this.contractPollTimer = window.setInterval(() => {
+      const nowSec = Math.floor(Date.now() / 1000);
       const openList = Array.from(this.contractsMap.values()).filter((c) => !c.isSold && !c.isExpired);
-      const wsReady =
-        this.authMode === 'OAUTH2_V2'
-          ? this.otpWs && this.otpWs.readyState === WebSocket.OPEN
-          : this.ws && this.ws.readyState === WebSocket.OPEN;
-      if (openList.length === 0 || wsReady) {
+      if (openList.length === 0) {
         if (this.contractPollTimer !== null) {
           window.clearInterval(this.contractPollTimer);
           this.contractPollTimer = null;
         }
         return;
       }
+      const wsReady =
+        this.authMode === 'OAUTH2_V2'
+          ? this.otpWs && this.otpWs.readyState === WebSocket.OPEN
+          : this.ws && this.ws.readyState === WebSocket.OPEN;
+
       for (const c of openList.slice(0, 6)) {
+        const ageSec = nowSec - (c.dateStart || nowSec);
+        if (wsReady && ageSec < 3) continue;
+
         if (this.authMode === 'OAUTH2_V2') {
-          void fetch('/api/v1/deriv/v2/contract-status', {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Requested-With': 'DQI-Client',
-            },
-            body: JSON.stringify({ accountId: c.loginid, contractId: c.contractId }),
-          })
-            .then((r) => (r.ok ? r.json() : null))
-            .then((data) => {
-              if (data?.proposal_open_contract) {
-                this.handleMessage(JSON.stringify(data));
-              }
+          if (this.otpWs && this.otpWs.readyState === WebSocket.OPEN) {
+            void this.otpRequest(c.loginid, {
+              proposal_open_contract: 1,
+              contract_id: c.contractId,
+            }).catch(() => {});
+          } else {
+            void fetch('/api/v1/deriv/v2/contract-status', {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'DQI-Client',
+              },
+              body: JSON.stringify({ accountId: c.loginid, contractId: c.contractId }),
             })
-            .catch(() => {});
+              .then((r) => (r.ok ? r.json() : null))
+              .then((data) => {
+                if (data?.proposal_open_contract) {
+                  this.handleMessage(JSON.stringify(data));
+                }
+              })
+              .catch(() => {});
+          }
+        } else if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          void this.request({ proposal_open_contract: 1, contract_id: c.contractId }).catch(() => {});
         } else {
           void this.requestViaProxy({ proposal_open_contract: 1, contract_id: c.contractId }).catch(() => {});
         }

@@ -203,10 +203,10 @@ export function evaluateLiveDigitSignals(params: {
       const sampleVsBe = blendedDifferRate - differBePct;
 
       const checkSample = n >= 100;
-      const checkMedCold = pctMed <= 7.0;
-      const checkLongSafe = pctLong <= 10.2;
+      const checkMedCold = pctMed <= 7.5;
+      const checkLongSafe = pctLong <= 10.6;
       const checkMicroQuiet = microCnt <= 1 && digit !== latestDigit;
-      const checkMarkovLow = latestFromTotal < 8 || transPct <= 10.0;
+      const checkMarkovLow = latestFromTotal < 8 || transPct <= 11.0;
       const checkVol = !extremeVol;
 
       const checks = [
@@ -235,7 +235,7 @@ export function evaluateLiveDigitSignals(params: {
         },
         {
           label: 'Sample vs Payout BE',
-          passed: sampleVsBe >= 1.0 && checkVol,
+          passed: sampleVsBe >= 0.5 && checkVol,
           detail: `${blendedDifferRate.toFixed(1)}% sample vs ${differBePct.toFixed(1)}% BE`,
         },
       ];
@@ -244,11 +244,9 @@ export function evaluateLiveDigitSignals(params: {
       const entryReady =
         checkSample &&
         checkMedCold &&
-        checkLongSafe &&
         checkMicroQuiet &&
-        checkMarkovLow &&
-        sampleVsBe >= 1.0 &&
-        checkVol;
+        checkVol &&
+        passedCount >= 4;
 
       const rawActivity =
         55 +
@@ -303,12 +301,12 @@ export function evaluateLiveDigitSignals(params: {
       const sampleVsBe = blendedMatchRate - matchBePct;
 
       const checkSample = n >= 100;
-      const checkMedHot = pctMed >= 15.0 && zMed >= 1.45;
-      const checkLongBias = pctLong >= 11.4 && zLong >= 0.95;
+      const checkMedHot = pctMed >= 14.0 && zMed >= 1.25;
+      const checkLongBias = pctLong >= 10.0 && zLong >= 0.0;
       const checkLiveTrigger =
-        microCnt >= 3 || (latestFromTotal >= 8 && transPct >= 18.0);
-      const checkCadence = gap >= 1 && gap <= 8;
-      const checkBeatsBe = sampleVsBe >= 2.0 && !extremeVol;
+        microCnt >= 3 || (latestFromTotal >= 8 && transPct >= 15.0);
+      const checkCadence = gap >= 1 && gap <= 9;
+      const checkBeatsBe = sampleVsBe >= 1.5 && !extremeVol;
 
       const checks = [
         {
@@ -317,7 +315,7 @@ export function evaluateLiveDigitSignals(params: {
           detail: `${pctMed.toFixed(1)}% hit (z=${zMed.toFixed(2)})`,
         },
         {
-          label: `${longN}t Sample Skew`,
+          label: `${longN}t Support`,
           passed: checkLongBias,
           detail: `${pctLong.toFixed(1)}% (z=${zLong.toFixed(2)})`,
         },
@@ -342,10 +340,9 @@ export function evaluateLiveDigitSignals(params: {
       const entryReady =
         checkSample &&
         checkMedHot &&
-        checkLongBias &&
         checkLiveTrigger &&
-        checkCadence &&
-        checkBeatsBe;
+        checkBeatsBe &&
+        passedCount >= 4;
 
       const rawActivity =
         38 +
