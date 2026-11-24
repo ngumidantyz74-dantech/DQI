@@ -1,15 +1,25 @@
-import type { ActiveSymbol, CandleBar, ContractSupport, LiveTickEvent } from '../types/dqi';
+import type {
+  ActiveSymbol,
+  CandleBar,
+  ContractSupport,
+  DerivAccountSummary,
+  DerivSessionState,
+  LiveDerivContract,
+  LiveTickEvent,
+} from '../types/dqi';
 
-const APP_ID =
+const DEFAULT_APP_ID =
   (typeof import.meta !== 'undefined' &&
     (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_DERIV_APP_ID) ||
   '1089';
 
-const WS_HOSTS = [
-  `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(APP_ID)}`,
-  `wss://green.derivws.com/websockets/v3?app_id=${encodeURIComponent(APP_ID)}`,
-  `wss://blue.derivws.com/websockets/v3?app_id=${encodeURIComponent(APP_ID)}`,
-];
+const SESSION_STORAGE_KEY = 'dqi_deriv_session_tokens_v1';
+
+interface StoredTokenMap {
+  activeLoginId: string | null;
+  appId?: string;
+  tokensByLoginId: Record<string, string>;
+}
 
 function extractLastDigitFromQuote(raw: number | string, pipSize: number): {
   rawQuote: string;
@@ -23,28 +33,158 @@ function extractLastDigitFromQuote(raw: number | string, pipSize: number): {
   return { rawQuote: formatted, quote: Number.isFinite(num) ? num : 0, lastDigit };
 }
 
-class BrowserDerivPublicClient {
+class BrowserDerivClient {
   private ws: WebSocket | null = null;
   private connecting: Promise<WebSocket> | null = null;
   private hostIdx = 0;
+  private appId = DEFAULT_APP_ID;
   private reqId = 1;
   private pending = new Map<
     number,
     { resolve: (data: Record<string, unknown>) => void; reject: (err: Error) => void; timer: number }
   >();
-  private listeners = new Map<string, Set<(tick: LiveTickEvent) => void>>();
+  private tickListeners = new Map<string, Set<(tick: LiveTickEvent) => void>>();
   private pipSizeBySymbol = new Map<string, number>();
   private tickBuffers = new Map<string, LiveTickEvent[]>();
+
+  // Authenticated Deriv Account & Real-Time Contract State
+  private tokensByLoginId: Record<string, string> = {};
+  private sessionState: DerivSessionState = {
+    connected: false,
+    appId: DEFAULT_APP_ID,
+    activeLoginId: null,
+    activeIsVirtual: true,
+    activeCurrency: 'USD',
+    activeBalance: null,
+    email: null,
+    fullname: null,
+    scopes: [],
+    accounts: [],
+    error: null,
+  };
+  private sessionListeners = new Set<(state: DerivSessionState) => void>();
+  private contractsMap = new Map<number, LiveDerivContract>();
+  private contractListeners = new Set<(contracts: LiveDerivContract[]) => void>();
+  private balanceSubActive = false;
+
+  constructor() {
+    this.restoreFromSessionStorage();
+  }
+
+  private wsUrls(): string[] {
+    const id = encodeURIComponent(this.appId || '1089');
+    return [
+      `wss://ws.derivws.com/websockets/v3?app_id=${id}`,
+      `wss://green.derivws.com/websockets/v3?app_id=${id}`,
+      `wss://blue.derivws.com/websockets/v3?app_id=${id}`,
+    ];
+  }
+
+  public setAppId(nextAppId: string): void {
+    const clean = nextAppId.trim();
+    if (!clean || clean === this.appId) return;
+    this.appId = clean;
+    this.sessionState = { ...this.sessionState, appId: clean };
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        // ignore
+      }
+      this.ws = null;
+    }
+    this.emitSession();
+  }
+
+  public getAppId(): string {
+    return this.appId;
+  }
+
+  private saveToSessionStorage(): void {
+    try {
+      if (typeof window === 'undefined') return;
+      const payload: StoredTokenMap = {
+        activeLoginId: this.sessionState.activeLoginId,
+        appId: this.appId,
+        tokensByLoginId: this.tokensByLoginId,
+      };
+      window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // ignore storage quota errors
+    }
+  }
+
+  private restoreFromSessionStorage(): void {
+    try {
+      if (typeof window === 'undefined') return;
+      const raw = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as StoredTokenMap;
+      if (parsed.appId) this.appId = parsed.appId;
+      if (parsed.tokensByLoginId && Object.keys(parsed.tokensByLoginId).length > 0) {
+        this.tokensByLoginId = parsed.tokensByLoginId;
+        const preferred =
+          (parsed.activeLoginId && parsed.tokensByLoginId[parsed.activeLoginId] ? parsed.activeLoginId : null) ||
+          Object.keys(parsed.tokensByLoginId).find((id) => id.startsWith('VRTC')) ||
+          Object.keys(parsed.tokensByLoginId)[0];
+        if (preferred) {
+          void this.authorizeToken(this.tokensByLoginId[preferred], { skipSave: true }).catch(() => {
+            // keep clean unauthenticated state if stored token expired
+          });
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private emitSession(): void {
+    const snapshot: DerivSessionState = {
+      ...this.sessionState,
+      accounts: [...this.sessionState.accounts],
+    };
+    for (const cb of this.sessionListeners) cb(snapshot);
+  }
+
+  private emitContracts(): void {
+    const list = Array.from(this.contractsMap.values()).sort((a, b) => b.dateStart - a.dateStart);
+    for (const cb of this.contractListeners) cb(list);
+  }
+
+  public getSessionState(): DerivSessionState {
+    return { ...this.sessionState, accounts: [...this.sessionState.accounts] };
+  }
+
+  public subscribeSession(cb: (state: DerivSessionState) => void): () => void {
+    this.sessionListeners.add(cb);
+    cb(this.getSessionState());
+    return () => {
+      this.sessionListeners.delete(cb);
+    };
+  }
+
+  public getContracts(): LiveDerivContract[] {
+    return Array.from(this.contractsMap.values()).sort((a, b) => b.dateStart - a.dateStart);
+  }
+
+  public subscribeContracts(cb: (contracts: LiveDerivContract[]) => void): () => void {
+    this.contractListeners.add(cb);
+    cb(this.getContracts());
+    return () => {
+      this.contractListeners.delete(cb);
+    };
+  }
 
   private async ensureWs(): Promise<WebSocket> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return this.ws;
     if (this.connecting) return this.connecting;
 
     this.connecting = (async () => {
+      const hosts = this.wsUrls();
       let lastErr: Error | null = null;
-      for (let i = 0; i < WS_HOSTS.length; i += 1) {
-        const idx = (this.hostIdx + i) % WS_HOSTS.length;
-        const url = WS_HOSTS[idx];
+      for (let i = 0; i < hosts.length; i += 1) {
+        const idx = (this.hostIdx + i) % hosts.length;
+        const url = hosts[idx];
         try {
           const ws = await new Promise<WebSocket>((resolve, reject) => {
             const socket = new WebSocket(url);
@@ -54,7 +194,7 @@ class BrowserDerivPublicClient {
               } catch {
                 // ignore
               }
-              reject(new Error('Browser Deriv WebSocket connection timed out'));
+              reject(new Error('Deriv WebSocket connection timed out'));
             }, 6500);
 
             socket.onopen = () => {
@@ -63,15 +203,17 @@ class BrowserDerivPublicClient {
             };
             socket.onerror = () => {
               window.clearTimeout(t);
-              reject(new Error('Browser Deriv WebSocket connection failed'));
+              reject(new Error('Deriv WebSocket connection failed'));
             };
           });
 
           this.hostIdx = idx;
           this.ws = ws;
+          this.balanceSubActive = false;
           ws.onmessage = (ev) => this.handleMessage(String(ev.data));
           ws.onclose = () => {
             this.ws = null;
+            this.balanceSubActive = false;
             for (const [id, entry] of this.pending.entries()) {
               window.clearTimeout(entry.timer);
               entry.reject(new Error('Deriv WebSocket closed'));
@@ -79,8 +221,17 @@ class BrowserDerivPublicClient {
             }
           };
 
-          // Re-subscribe active listeners
-          for (const sym of this.listeners.keys()) {
+          // Re-authorize active token on reconnect
+          const activeToken =
+            this.sessionState.activeLoginId && this.tokensByLoginId[this.sessionState.activeLoginId];
+          if (activeToken) {
+            void this.authorizeToken(activeToken, { skipSave: true }).catch(() => {
+              // ignore reconnect auth error
+            });
+          }
+
+          // Re-subscribe active tick listeners
+          for (const sym of this.tickListeners.keys()) {
             ws.send(JSON.stringify({ ticks: sym, subscribe: 1 }));
           }
 
@@ -118,6 +269,7 @@ class BrowserDerivPublicClient {
       }
     }
 
+    // 1. Live Tick Stream
     const tick = msg.tick as
       | { symbol?: string; epoch?: number; quote?: number; pip_size?: number }
       | undefined;
@@ -143,10 +295,108 @@ class BrowserDerivPublicClient {
       if (buf.length > 1000) buf.splice(0, buf.length - 1000);
       this.tickBuffers.set(tick.symbol, buf);
 
-      const subs = this.listeners.get(tick.symbol);
+      const subs = this.tickListeners.get(tick.symbol);
       if (subs) {
         for (const cb of subs) cb(evt);
       }
+    }
+
+    // 2. Live Subscribed Balance Updates (All Demo & Real Accounts)
+    const bal = msg.balance as
+      | {
+          balance?: number;
+          currency?: string;
+          loginid?: string;
+          accounts?: Record<string, { balance?: number; currency?: string; type?: string }>;
+        }
+      | undefined;
+    if (bal) {
+      let updated = false;
+      const nextAccounts = this.sessionState.accounts.map((acct) => {
+        const fromAll = bal.accounts?.[acct.loginid];
+        if (fromAll && typeof fromAll.balance === 'number') {
+          updated = true;
+          return { ...acct, balance: fromAll.balance, currency: fromAll.currency || acct.currency };
+        }
+        if (bal.loginid === acct.loginid && typeof bal.balance === 'number') {
+          updated = true;
+          return { ...acct, balance: bal.balance, currency: bal.currency || acct.currency };
+        }
+        return acct;
+      });
+
+      const activeMatch = nextAccounts.find((a) => a.loginid === this.sessionState.activeLoginId);
+      const nextActiveBal =
+        bal.loginid === this.sessionState.activeLoginId && typeof bal.balance === 'number'
+          ? bal.balance
+          : activeMatch?.balance ?? this.sessionState.activeBalance;
+
+      if (updated || typeof nextActiveBal === 'number') {
+        this.sessionState = {
+          ...this.sessionState,
+          activeBalance: nextActiveBal,
+          accounts: nextAccounts,
+        };
+        this.emitSession();
+      }
+    }
+
+    // 3. Real-Time Live Open Contract Updates (proposal_open_contract)
+    const poc = msg.proposal_open_contract as
+      | {
+          contract_id?: number;
+          underlying?: string;
+          contract_type?: string;
+          longcode?: string;
+          currency?: string;
+          buy_price?: number;
+          payout?: number;
+          bid_price?: number;
+          profit?: number;
+          profit_percentage?: number;
+          entry_spot_display_value?: string;
+          entry_spot?: number;
+          current_spot_display_value?: string;
+          current_spot?: number;
+          barrier?: string;
+          is_sold?: number;
+          is_expired?: number;
+          status?: 'open' | 'won' | 'lost' | 'sold';
+          date_start?: number;
+          date_expiry?: number;
+          tick_count?: number;
+          account_id?: number;
+        }
+      | undefined;
+    if (poc?.contract_id) {
+      const existing = this.contractsMap.get(poc.contract_id);
+      const contract: LiveDerivContract = {
+        contractId: poc.contract_id,
+        symbol: String(poc.underlying || existing?.symbol || ''),
+        contractType: String(poc.contract_type || existing?.contractType || ''),
+        longcode: String(poc.longcode || existing?.longcode || ''),
+        currency: String(poc.currency || existing?.currency || this.sessionState.activeCurrency || 'USD'),
+        buyPrice: Number(poc.buy_price ?? existing?.buyPrice ?? 0),
+        payout: Number(poc.payout ?? existing?.payout ?? 0),
+        bidPrice: Number(poc.bid_price ?? existing?.bidPrice ?? 0),
+        profit: Number(poc.profit ?? existing?.profit ?? 0),
+        profitPct: Number(poc.profit_percentage ?? existing?.profitPct ?? 0),
+        entrySpot: poc.entry_spot_display_value ?? (poc.entry_spot !== undefined ? String(poc.entry_spot) : existing?.entrySpot ?? null),
+        currentSpot:
+          poc.current_spot_display_value ??
+          (poc.current_spot !== undefined ? String(poc.current_spot) : existing?.currentSpot ?? null),
+        barrier: poc.barrier ?? existing?.barrier ?? null,
+        isSold: Boolean(poc.is_sold),
+        isExpired: Boolean(poc.is_expired),
+        status: poc.status || existing?.status || 'open',
+        dateStart: Number(poc.date_start ?? existing?.dateStart ?? Math.floor(Date.now() / 1000)),
+        dateExpiry: poc.date_expiry ?? existing?.dateExpiry ?? null,
+        tickCount: poc.tick_count ?? existing?.tickCount ?? null,
+        isVirtual: existing?.isVirtual ?? this.sessionState.activeIsVirtual,
+        loginid: existing?.loginid ?? this.sessionState.activeLoginId ?? '',
+      };
+      this.contractsMap.set(poc.contract_id, contract);
+      this.emitContracts();
     }
   }
 
@@ -157,11 +407,265 @@ class BrowserDerivPublicClient {
       const timer = window.setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('Deriv request timed out'));
-      }, 10_000);
+      }, 12_000);
       this.pending.set(id, { resolve, reject, timer });
       ws.send(JSON.stringify({ ...payload, req_id: id }));
     });
   }
+
+  // ---------------- AUTHENTICATION (DERIV OAUTH & API TOKEN) ----------------
+
+  public async authorizeOAuthAccounts(entries: Array<{ loginid: string; token: string; currency?: string }>): Promise<DerivSessionState> {
+    for (const item of entries) {
+      if (item.loginid && item.token) {
+        this.tokensByLoginId[item.loginid] = item.token;
+      }
+    }
+    // Always start safely on Demo (VRTC...) if present
+    const defaultEntry = entries.find((e) => e.loginid.startsWith('VRTC')) || entries[0];
+    if (!defaultEntry) {
+      throw new Error('No Deriv accounts received from OAuth redirect');
+    }
+    return this.authorizeToken(defaultEntry.token);
+  }
+
+  public async authorizeToken(token: string, opts?: { skipSave?: boolean }): Promise<DerivSessionState> {
+    const cleanToken = token.trim();
+    if (!cleanToken) throw new Error('API token cannot be empty');
+
+    const res = await this.request({ authorize: cleanToken });
+    const auth = res.authorize as {
+      loginid: string;
+      balance: number;
+      currency: string;
+      email?: string;
+      fullname?: string;
+      is_virtual: number;
+      scopes?: string[];
+      account_list?: Array<{
+        loginid: string;
+        currency: string;
+        is_virtual: number;
+        account_category?: string;
+        is_disabled?: number;
+      }>;
+    };
+
+    if (!auth?.loginid) {
+      throw new Error('Deriv authorization returned invalid account payload');
+    }
+
+    this.tokensByLoginId[auth.loginid] = cleanToken;
+
+    const existingBalMap = new Map(this.sessionState.accounts.map((a) => [a.loginid, a.balance]));
+    const accounts: DerivAccountSummary[] = (auth.account_list || [])
+      .filter((a) => !a.is_disabled)
+      .map((a) => ({
+        loginid: a.loginid,
+        currency: a.currency || 'USD',
+        isVirtual: Boolean(a.is_virtual),
+        balance: a.loginid === auth.loginid ? Number(auth.balance) : existingBalMap.get(a.loginid) ?? null,
+        hasToken: Boolean(this.tokensByLoginId[a.loginid]),
+        accountCategory: a.account_category,
+      }));
+
+    if (!accounts.some((a) => a.loginid === auth.loginid)) {
+      accounts.unshift({
+        loginid: auth.loginid,
+        currency: auth.currency || 'USD',
+        isVirtual: Boolean(auth.is_virtual),
+        balance: Number(auth.balance),
+        hasToken: true,
+      });
+    }
+
+    this.sessionState = {
+      connected: true,
+      appId: this.appId,
+      activeLoginId: auth.loginid,
+      activeIsVirtual: Boolean(auth.is_virtual),
+      activeCurrency: auth.currency || 'USD',
+      activeBalance: Number(auth.balance),
+      email: auth.email || null,
+      fullname: auth.fullname || null,
+      scopes: auth.scopes || [],
+      accounts,
+      error: null,
+    };
+
+    if (!opts?.skipSave) {
+      this.saveToSessionStorage();
+    }
+    this.emitSession();
+
+    // Subscribe to live balance updates across ALL linked Demo & Real accounts
+    try {
+      if (!this.balanceSubActive) {
+        this.balanceSubActive = true;
+        await this.request({ balance: 1, account: 'all', subscribe: 1 });
+      } else {
+        await this.request({ balance: 1, account: 'all' });
+      }
+    } catch {
+      // Fallback single-account balance subscription
+      try {
+        await this.request({ balance: 1, subscribe: 1 });
+      } catch {
+        // ignore non-fatal balance stream error
+      }
+    }
+
+    // Load any currently open contracts on this Deriv account
+    try {
+      const portfolio = await this.request({ portfolio: 1 });
+      const list = (portfolio.portfolio as { contracts?: Array<{ contract_id: number }> })?.contracts || [];
+      for (const c of list.slice(0, 10)) {
+        if (c.contract_id) {
+          void this.request({ proposal_open_contract: 1, contract_id: c.contract_id, subscribe: 1 }).catch(() => {});
+        }
+      }
+    } catch {
+      // ignore if portfolio empty or read restricted
+    }
+
+    return this.getSessionState();
+  }
+
+  public async switchAccount(loginid: string): Promise<DerivSessionState> {
+    const token = this.tokensByLoginId[loginid];
+    if (!token) {
+      throw new Error(
+        `No API token stored for ${loginid}. Connect via Deriv OAuth or enter a token generated for ${loginid} on app.deriv.com/account/api-token.`
+      );
+    }
+    return this.authorizeToken(token);
+  }
+
+  public disconnectSession(): void {
+    this.tokensByLoginId = {};
+    this.contractsMap.clear();
+    this.balanceSubActive = false;
+    this.sessionState = {
+      connected: false,
+      appId: this.appId,
+      activeLoginId: null,
+      activeIsVirtual: true,
+      activeCurrency: 'USD',
+      activeBalance: null,
+      email: null,
+      fullname: null,
+      scopes: [],
+      accounts: [],
+      error: null,
+    };
+    try {
+      if (typeof window !== 'undefined') {
+        window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
+      }
+      this.ws?.send(JSON.stringify({ logout: 1 }));
+    } catch {
+      // ignore
+    }
+    this.emitContracts();
+    this.emitSession();
+  }
+
+  // ---------------- LIVE REAL / DEMO TRADING & PROPOSAL STREAMING ----------------
+
+  public async buyContract(payload: {
+    symbol: string;
+    contractType: string;
+    amount: number;
+    duration: number;
+    durationUnit: 't' | 's' | 'm' | 'h' | 'd';
+    barrier?: string;
+  }): Promise<LiveDerivContract> {
+    if (!this.sessionState.connected || !this.sessionState.activeLoginId) {
+      throw new Error('Connect your Deriv Demo or Real account first.');
+    }
+
+    const currency = this.sessionState.activeCurrency || 'USD';
+    const parameters: Record<string, unknown> = {
+      amount: payload.amount,
+      basis: 'stake',
+      contract_type: payload.contractType,
+      currency,
+      duration: payload.duration,
+      duration_unit: payload.durationUnit,
+      symbol: payload.symbol,
+    };
+    if (payload.barrier !== undefined && payload.barrier !== '') {
+      parameters.barrier = payload.barrier;
+    }
+
+    const res = await this.request({
+      buy: 1,
+      price: payload.amount,
+      parameters,
+    });
+
+    const buy = res.buy as {
+      contract_id: number;
+      buy_price: number;
+      payout: number;
+      longcode: string;
+      balance_after: number;
+      start_time: number;
+    };
+
+    const initialContract: LiveDerivContract = {
+      contractId: buy.contract_id,
+      symbol: payload.symbol,
+      contractType: payload.contractType,
+      longcode: buy.longcode || `${payload.contractType} ${payload.symbol}`,
+      currency,
+      buyPrice: Number(buy.buy_price),
+      payout: Number(buy.payout),
+      bidPrice: Number(buy.buy_price),
+      profit: 0,
+      profitPct: 0,
+      entrySpot: null,
+      currentSpot: null,
+      barrier: payload.barrier ?? null,
+      isSold: false,
+      isExpired: false,
+      status: 'open',
+      dateStart: Number(buy.start_time || Math.floor(Date.now() / 1000)),
+      dateExpiry: null,
+      tickCount: payload.durationUnit === 't' ? payload.duration : null,
+      isVirtual: this.sessionState.activeIsVirtual,
+      loginid: this.sessionState.activeLoginId,
+    };
+
+    this.contractsMap.set(buy.contract_id, initialContract);
+    if (typeof buy.balance_after === 'number') {
+      this.sessionState = {
+        ...this.sessionState,
+        activeBalance: Number(buy.balance_after),
+        accounts: this.sessionState.accounts.map((a) =>
+          a.loginid === this.sessionState.activeLoginId ? { ...a, balance: Number(buy.balance_after) } : a
+        ),
+      };
+      this.emitSession();
+    }
+    this.emitContracts();
+
+    // Subscribe to real-time tick-by-tick P&L calculation (proposal_open_contract)
+    void this.request({
+      proposal_open_contract: 1,
+      contract_id: buy.contract_id,
+      subscribe: 1,
+    }).catch(() => {});
+
+    return initialContract;
+  }
+
+  public async sellContract(contractId: number): Promise<void> {
+    await this.request({ sell: contractId, price: 0 });
+    await this.request({ proposal_open_contract: 1, contract_id: contractId }).catch(() => {});
+  }
+
+  // ---------------- PUBLIC MARKET DATA ----------------
 
   async fetchActiveSymbols(): Promise<ActiveSymbol[]> {
     const res = await this.request({ active_symbols: 'brief', product_type: 'basic' });
@@ -178,8 +682,7 @@ class BrowserDerivPublicClient {
   async fetchContractsFor(symbol: string): Promise<ContractSupport> {
     const res = await this.request({ contracts_for: symbol, currency: 'USD', product_type: 'basic' });
     const available =
-      ((res.contracts_for as { available?: Array<{ contract_type?: string; min_contract_duration?: string; max_contract_duration?: string }> })?.available) ??
-      [];
+      ((res.contracts_for as { available?: Array<{ contract_type?: string }> })?.available) ?? [];
     const supportedTypes = Array.from(new Set(available.map((c) => c.contract_type).filter(Boolean))) as string[];
     const has = (t: string) => supportedTypes.includes(t);
     return {
@@ -206,7 +709,14 @@ class BrowserDerivPublicClient {
       granularity,
       style: 'candles',
     });
-    const raw = (res.candles as Array<{ epoch: number; open: string | number; high: string | number; low: string | number; close: string | number }> | undefined) ?? [];
+    const raw =
+      (res.candles as Array<{
+        epoch: number;
+        open: string | number;
+        high: string | number;
+        low: string | number;
+        close: string | number;
+      }> | undefined) ?? [];
     return raw.map((c) => ({
       epoch: Number(c.epoch),
       open: Number(c.open),
@@ -264,7 +774,7 @@ class BrowserDerivPublicClient {
       amount: payload.amount,
       basis: 'stake',
       contract_type: payload.contractType,
-      currency: 'USD',
+      currency: this.sessionState.activeCurrency || 'USD',
       duration: payload.duration,
       duration_unit: payload.durationUnit,
       symbol: payload.symbol,
@@ -297,10 +807,10 @@ class BrowserDerivPublicClient {
     }
   ): () => void {
     let closed = false;
-    let set = this.listeners.get(symbol);
+    let set = this.tickListeners.get(symbol);
     if (!set) {
       set = new Set();
-      this.listeners.set(symbol, set);
+      this.tickListeners.set(symbol, set);
     }
     const cb = (t: LiveTickEvent) => {
       if (!closed) handlers.onTick?.(t);
@@ -323,18 +833,18 @@ class BrowserDerivPublicClient {
         ws.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
       } catch (err) {
         if (!closed) {
-          handlers.onError?.(err instanceof Error ? err.message : 'Browser Deriv WebSocket failed');
+          handlers.onError?.(err instanceof Error ? err.message : 'Deriv WebSocket connection failed');
         }
       }
     })();
 
     return () => {
       closed = true;
-      const cur = this.listeners.get(symbol);
+      const cur = this.tickListeners.get(symbol);
       if (cur) {
         cur.delete(cb);
         if (cur.size === 0) {
-          this.listeners.delete(symbol);
+          this.tickListeners.delete(symbol);
           try {
             this.ws?.send(JSON.stringify({ forget_all: 'ticks' }));
           } catch {
@@ -346,4 +856,4 @@ class BrowserDerivPublicClient {
   }
 }
 
-export const browserDerivPublic = new BrowserDerivPublicClient();
+export const browserDerivPublic = new BrowserDerivClient();

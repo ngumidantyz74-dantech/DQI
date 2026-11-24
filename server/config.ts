@@ -27,15 +27,20 @@ export const serverConfig = {
     .map((s) => s.trim())
     .filter(Boolean),
 
-  databaseUrl: process.env.DATABASE_URL || '',
-  databaseUrlUnpooled: process.env.DATABASE_URL_UNPOOLED || process.env.DATABASE_URL || '',
+  databaseUrl: process.env.DATABASE_URL || process.env.POSTGRES_URL || '',
+  databaseUrlUnpooled:
+    process.env.DATABASE_URL_UNPOOLED ||
+    process.env.POSTGRES_URL_NON_POOLING ||
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    '',
 
   derivClientId: process.env.DERIV_CLIENT_ID || '',
   derivAppId: process.env.DERIV_APP_ID || process.env.VITE_DERIV_APP_ID || '1089',
   derivRedirectUri: process.env.DERIV_REDIRECT_URI || '',
   derivOAuthScopes: process.env.DERIV_OAUTH_SCOPES || 'read trade',
   derivApiBaseUrl: process.env.DERIV_API_BASE_URL || 'https://api.derivws.com',
-  derivAuthBaseUrl: process.env.DERIV_AUTH_BASE_URL || 'https://auth.deriv.com',
+  derivAuthBaseUrl: process.env.DERIV_AUTH_BASE_URL || 'https://oauth.deriv.com',
   derivPublicWsUrl: process.env.DERIV_PUBLIC_WS_URL || 'wss://ws.derivws.com/websockets/v3',
 
   sessionSecret: process.env.DQI_SESSION_SECRET || process.env.QUANT_SESSION_SECRET || EPHEMERAL_SESSION_KEY,
@@ -65,5 +70,5 @@ export function getEncryptionKey(): Buffer {
 }
 
 export function isDerivOAuthConfigured(): boolean {
-  return Boolean(serverConfig.derivClientId && serverConfig.derivRedirectUri);
+  return Boolean(serverConfig.derivClientId || serverConfig.derivAppId);
 }

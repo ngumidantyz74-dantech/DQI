@@ -1,5 +1,52 @@
 export type DqiTab = 'analyser' | 'terminal' | 'digits' | 'scanner' | 'strategy' | 'risk';
 
+export interface DerivAccountSummary {
+  loginid: string;
+  currency: string;
+  isVirtual: boolean;
+  balance: number | null;
+  hasToken: boolean;
+  accountCategory?: string;
+}
+
+export interface DerivSessionState {
+  connected: boolean;
+  appId: string;
+  activeLoginId: string | null;
+  activeIsVirtual: boolean;
+  activeCurrency: string;
+  activeBalance: number | null;
+  email: string | null;
+  fullname: string | null;
+  scopes: string[];
+  accounts: DerivAccountSummary[];
+  error: string | null;
+}
+
+export interface LiveDerivContract {
+  contractId: number;
+  symbol: string;
+  contractType: string;
+  longcode: string;
+  currency: string;
+  buyPrice: number;
+  payout: number;
+  bidPrice: number;
+  profit: number;
+  profitPct: number;
+  entrySpot: string | null;
+  currentSpot: string | null;
+  barrier: string | null;
+  isSold: boolean;
+  isExpired: boolean;
+  status: 'open' | 'won' | 'lost' | 'sold';
+  dateStart: number;
+  dateExpiry: number | null;
+  tickCount: number | null;
+  isVirtual: boolean;
+  loginid: string;
+}
+
 export interface AiAnalyzeBrief {
   headline: string;
   verdict: 'RISE_BIAS' | 'FALL_BIAS' | 'EVEN_ODD_WATCH' | 'DIFFER_WATCH' | 'WAIT_BALANCED';

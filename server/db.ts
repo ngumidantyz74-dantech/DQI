@@ -166,7 +166,7 @@ class PreviewRuntimeStore {
   liveGate: LiveExecutionGateState = {
     live_enabled: false,
     automation_enabled: false,
-    kill_switch: true,
+    kill_switch: false,
     require_manual_approval: true,
     max_stake: serverConfig.liveMaxStake,
     max_daily_loss: serverConfig.liveMaxDailyLoss,

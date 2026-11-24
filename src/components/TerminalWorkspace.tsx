@@ -4,20 +4,20 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   CandlestickChart,
-  Clock,
   RefreshCw,
   Search,
   ShieldAlert,
   TrendingUp,
+  Wallet,
 } from 'lucide-react';
 import { dqiApi } from '../services/dqiApi';
 import type {
   ActiveSymbol,
   CandleBar,
   ContractSupport,
+  DerivSessionState,
+  LiveDerivContract,
   LiveTickEvent,
-  PaperAccount,
-  PaperPosition,
   QuantAnalysis,
 } from '../types/dqi';
 
@@ -30,6 +30,7 @@ interface TerminalWorkspaceProps {
   feedHealth: { state: string; isStale: boolean; ageSeconds: number | null };
   onOpenDigits: () => void;
   onRefreshSymbols: () => void;
+  onOpenConnect?: () => void;
 }
 
 const TF_OPTIONS: Array<{ label: string; granularity: number }> = [
@@ -51,6 +52,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   feedHealth,
   onOpenDigits,
   onRefreshSymbols,
+  onOpenConnect,
 }) => {
   const [search, setSearch] = useState('');
   const [marketFilter, setMarketFilter] = useState('ALL');
@@ -64,11 +66,13 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
   const [contracts, setContracts] = useState<ContractSupport | null>(null);
   const [quant, setQuant] = useState<QuantAnalysis | null>(null);
 
-  // Trade ticket state (Paper virtual account vs Real locked notice)
-  const [tradeEnv, setTradeEnv] = useState<'PAPER' | 'LIVE'>('PAPER');
+  // Connected Deriv Demo / Real Session & Live Open Contracts
+  const [derivSession, setDerivSession] = useState<DerivSessionState>(() => dqiApi.getDerivSession());
+  const [liveContracts, setLiveContracts] = useState<LiveDerivContract[]>([]);
+  const [realConfirm, setRealConfirm] = useState(false);
   const [contractType, setContractType] = useState('CALL');
-  const [stake, setStake] = useState('10');
-  const [durationSec, setDurationSec] = useState('15');
+  const [stake, setStake] = useState('1');
+  const [durationSec, setDurationSec] = useState('5');
   const [barrier, setBarrier] = useState('5');
   const [proposal, setProposal] = useState<{
     askPrice: number;
@@ -77,9 +81,6 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     fetchedAt: string;
   } | null>(null);
   const [proposalBusy, setProposalBusy] = useState(false);
-
-  const [paperAccount, setPaperAccount] = useState<PaperAccount | null>(null);
-  const [positions, setPositions] = useState<PaperPosition[]>([]);
   const [tradeMsg, setTradeMsg] = useState<string | null>(null);
   const [tradeBusy, setTradeBusy] = useState(false);
 
@@ -132,26 +133,24 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     }
   }
 
-  async function loadPaperLedger() {
-    try {
-      const [acc, pos] = await Promise.all([dqiApi.getPaperAccount(), dqiApi.getPaperPositions()]);
-      setPaperAccount(acc);
-      setPositions(pos.positions || []);
-    } catch {
-      // ignore
-    }
-  }
-
   useEffect(() => {
     loadChartAndContext();
     setProposal(null);
   }, [selectedSymbol, timeframe]);
 
   useEffect(() => {
-    loadPaperLedger();
-    const timer = setInterval(loadPaperLedger, 5000);
-    return () => clearInterval(timer);
+    const unsubSess = dqiApi.subscribeDerivSession(setDerivSession);
+    const unsubContracts = dqiApi.subscribeDerivContracts(setLiveContracts);
+    return () => {
+      unsubSess();
+      unsubContracts();
+    };
   }, []);
+
+  // Reset confirmation whenever active account changes
+  useEffect(() => {
+    setRealConfirm(false);
+  }, [derivSession.activeLoginId]);
 
   // Update the last candle live when ticks arrive
   const liveCandles = useMemo(() => {
@@ -176,18 +175,61 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     return { min, max, lastClose: last.close, changePct };
   }, [liveCandles]);
 
+  // Auto-refresh live Deriv proposal calculation as user adjusts contract, digit, stake, or duration
+  useEffect(() => {
+    let cancelled = false;
+    const isDigit = contractType.startsWith('DIGIT');
+    const useBarrier =
+      contractType === 'DIGITMATCH' ||
+      contractType === 'DIGITDIFF' ||
+      contractType === 'DIGITOVER' ||
+      contractType === 'DIGITUNDER';
+    const dur = isDigit
+      ? Math.min(10, Math.max(1, Number(durationSec) || 1))
+      : Math.max(5, Number(durationSec) || 5);
+    void dqiApi
+      .getProposal({
+        symbol: selectedSymbol,
+        contractType,
+        amount: Math.max(0.35, Number(stake) || 1),
+        duration: dur,
+        durationUnit: isDigit ? 't' : 't',
+        barrier: useBarrier ? barrier : undefined,
+      })
+      .then((p) => {
+        if (!cancelled) {
+          setProposal({
+            askPrice: p.askPrice,
+            payout: p.payout,
+            breakEvenProbPct: p.breakEvenProbPct,
+            fetchedAt: p.fetchedAt,
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setProposal(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSymbol, contractType, stake, durationSec, barrier]);
+
   async function handleFetchQuote() {
     setProposalBusy(true);
     setTradeMsg(null);
     try {
       const isDigit = contractType.startsWith('DIGIT');
-      const useBarrier = contractType === 'DIGITMATCH' || contractType === 'DIGITDIFF' || contractType === 'DIGITOVER' || contractType === 'DIGITUNDER';
+      const useBarrier =
+        contractType === 'DIGITMATCH' ||
+        contractType === 'DIGITDIFF' ||
+        contractType === 'DIGITOVER' ||
+        contractType === 'DIGITUNDER';
       const p = await dqiApi.getProposal({
         symbol: selectedSymbol,
         contractType,
         amount: Math.max(0.35, Number(stake) || 1),
-        duration: isDigit ? 1 : Math.max(15, Number(durationSec) || 15),
-        durationUnit: isDigit ? 't' : 's',
+        duration: isDigit ? Math.min(10, Math.max(1, Number(durationSec) || 1)) : Math.max(1, Number(durationSec) || 5),
+        durationUnit: 't',
         barrier: useBarrier ? barrier : undefined,
       });
       setProposal({
@@ -203,52 +245,49 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
     }
   }
 
-  async function handleOpenPaperTrade() {
+  async function handleBuyDerivContract() {
+    if (!derivSession.connected || !derivSession.activeLoginId) {
+      setTradeMsg('Connect your Deriv account first using Connect Deriv in the top header.');
+      return;
+    }
+    if (!derivSession.activeIsVirtual && !realConfirm) {
+      setTradeMsg('Confirm Real-Money execution checkbox below before trading on your Real CR account.');
+      return;
+    }
     setTradeBusy(true);
     setTradeMsg(null);
     try {
-      const payoutMult =
-        proposal && proposal.askPrice > 0
-          ? Number(((proposal.payout - proposal.askPrice) / proposal.askPrice).toFixed(4))
-          : contractType === 'DIGITMATCH'
-            ? 8.0
-            : contractType === 'DIGITDIFF'
-              ? 0.1
-              : 0.85;
       const isDigit = contractType.startsWith('DIGIT');
-      const expiry = isDigit ? 3 : Math.max(5, Number(durationSec) || 15);
-      await dqiApi.openPaperTrade({
+      const useBarrier =
+        contractType === 'DIGITMATCH' ||
+        contractType === 'DIGITDIFF' ||
+        contractType === 'DIGITOVER' ||
+        contractType === 'DIGITUNDER';
+      const bought = await dqiApi.buyDerivContract({
         symbol: selectedSymbol,
-        timeframe,
         contractType,
-        barrier:
-          contractType === 'DIGITMATCH' ||
-          contractType === 'DIGITDIFF' ||
-          contractType === 'DIGITOVER' ||
-          contractType === 'DIGITUNDER'
-            ? barrier
-            : undefined,
-        direction: contractType === 'PUT' ? 'SELL' : 'BUY',
-        stake: Number(stake) || 10,
-        expiry_seconds: expiry,
-        payout_multiplier: Math.min(10, Math.max(0.05, payoutMult)),
+        amount: Math.max(0.35, Number(stake) || 1),
+        duration: isDigit ? Math.min(10, Math.max(1, Number(durationSec) || 1)) : Math.max(1, Number(durationSec) || 5),
+        durationUnit: 't',
+        barrier: useBarrier ? barrier : undefined,
       });
-      setTradeMsg('Paper position opened on live Deriv price.');
-      await loadPaperLedger();
+      setTradeMsg(
+        `Contract #${bought.contractId} live on ${derivSession.activeIsVirtual ? 'DEMO' : 'REAL'} (${derivSession.activeLoginId}). Streaming live P&L below.`
+      );
     } catch (err) {
-      setTradeMsg(err instanceof Error ? err.message : 'Unable to open paper trade');
+      setTradeMsg(err instanceof Error ? err.message : 'Deriv order rejected');
     } finally {
       setTradeBusy(false);
     }
   }
 
-  async function handleSettle(id: number) {
+  async function handleSellEarly(contractId: number) {
     setTradeBusy(true);
     try {
-      await dqiApi.settlePaperPosition(id);
-      await loadPaperLedger();
+      await dqiApi.sellDerivContract(contractId);
+      setTradeMsg(`Sold contract #${contractId} at live market bid.`);
     } catch (err) {
-      setTradeMsg(err instanceof Error ? err.message : 'Settlement error');
+      setTradeMsg(err instanceof Error ? err.message : 'Unable to sell early');
     } finally {
       setTradeBusy(false);
     }
@@ -527,230 +566,302 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
         </div>
       </section>
 
-      {/* RIGHT TRADE TICKET & PAPER POSITIONS */}
+      {/* RIGHT DERIV ORDER TICKET & LIVE POSITIONS */}
       <aside className="lg:col-span-3 space-y-4">
         <div className="bg-white dark:bg-[#151717] border border-[#E5E9EF] dark:border-[#2A2D30] rounded-lg p-4 space-y-4">
           <div className="flex items-center justify-between border-b border-[#E5E9EF] dark:border-[#2A2D30] pb-3">
             <div>
-              <h2 className="text-sm font-semibold text-[#20242B] dark:text-white">Order Ticket</h2>
-              <p className="text-xs text-[#6B7280]">Virtual simulation or gated live proposal</p>
-            </div>
-            <div className="flex rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] p-0.5 text-xs">
-              <button
-                type="button"
-                onClick={() => setTradeEnv('PAPER')}
-                className={`px-2.5 py-1 rounded font-medium ${
-                  tradeEnv === 'PAPER' ? 'bg-[#00A88F] text-white' : 'text-[#6B7280]'
-                }`}
-              >
-                Paper
-              </button>
-              <button
-                type="button"
-                onClick={() => setTradeEnv('LIVE')}
-                className={`px-2.5 py-1 rounded font-medium ${
-                  tradeEnv === 'LIVE' ? 'bg-[#FF444F] text-white' : 'text-[#6B7280]'
-                }`}
-              >
-                Live
-              </button>
-            </div>
-          </div>
-
-          {tradeEnv === 'LIVE' ? (
-            <div className="p-3 rounded-md bg-[#FF4D5A]/10 border border-[#FF4D5A]/30 text-xs space-y-2">
-              <div className="flex items-center gap-2 font-semibold text-[#FF4D5A]">
-                <ShieldAlert className="w-4 h-4 shrink-0" />
-                Live Trading Locked by Safety Policy
-              </div>
-              <p className="text-[#20242B] dark:text-[#D1D5DB]">
-                Real-money orders stay OFF by default until Deriv OAuth is connected, Demo testing passes, and the Risk & Accounts gate is unlocked.
+              <h2 className="text-sm font-semibold text-[#20242B] dark:text-white">Deriv Order Ticket</h2>
+              <p className="text-xs text-[#6B7280]">
+                {derivSession.connected
+                  ? `${derivSession.activeIsVirtual ? 'Demo' : 'Real'} · ${derivSession.activeLoginId}`
+                  : 'Connect Deriv Demo or Real'}
               </p>
             </div>
-          ) : (
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-medium text-[#6B7280] mb-1">Contract Type</label>
-                <select
-                  value={contractType}
-                  onChange={(e) => {
-                    setContractType(e.target.value);
-                    setProposal(null);
-                  }}
-                  className="w-full px-3 py-2 text-xs rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30] text-[#20242B] dark:text-white"
-                >
-                  <option value="CALL">Rise (CALL)</option>
-                  <option value="PUT">Fall (PUT)</option>
-                  <option value="DIGITMATCH" disabled={contracts ? !contracts.supportsMatch : false}>
-                    Digit Matches {contracts && !contracts.supportsMatch ? '(Unsupported)' : ''}
-                  </option>
-                  <option value="DIGITDIFF" disabled={contracts ? !contracts.supportsDiffer : false}>
-                    Digit Differs {contracts && !contracts.supportsDiffer ? '(Unsupported)' : ''}
-                  </option>
-                  <option value="DIGITEVEN" disabled={contracts ? !contracts.supportsEvenOdd : false}>
-                    Digit Even
-                  </option>
-                  <option value="DIGITODD" disabled={contracts ? !contracts.supportsEvenOdd : false}>
-                    Digit Odd
-                  </option>
-                </select>
-              </div>
-
-              {(contractType === 'DIGITMATCH' || contractType === 'DIGITDIFF') && (
-                <div>
-                  <label className="block text-xs font-medium text-[#6B7280] mb-1">Target Digit (0–9)</label>
-                  <div className="grid grid-cols-5 gap-1">
-                    {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => (
-                      <button
-                        key={d}
-                        type="button"
-                        onClick={() => setBarrier(String(d))}
-                        className={`py-1.5 text-xs font-mono font-semibold rounded border ${
-                          barrier === String(d)
-                            ? 'bg-[#0866FF] text-white border-[#0866FF]'
-                            : 'bg-[#F5F7FA] dark:bg-[#1D1F20] border-[#E5E9EF] dark:border-[#2A2D30] text-[#20242B] dark:text-white'
-                        }`}
-                      >
-                        {d}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="block text-xs font-medium text-[#6B7280] mb-1">Stake (USD)</label>
-                  <input
-                    type="number"
-                    min="0.35"
-                    step="0.5"
-                    value={stake}
-                    onChange={(e) => setStake(e.target.value)}
-                    className="w-full px-3 py-2 text-xs font-mono tabular-nums rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#6B7280] mb-1">
-                    {contractType.startsWith('DIGIT') ? 'Duration (Ticks)' : 'Expiry (Sec)'}
-                  </label>
-                  <input
-                    type="number"
-                    min="1"
-                    value={contractType.startsWith('DIGIT') ? '1' : durationSec}
-                    disabled={contractType.startsWith('DIGIT')}
-                    onChange={(e) => setDurationSec(e.target.value)}
-                    className="w-full px-3 py-2 text-xs font-mono tabular-nums rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30]"
-                  />
-                </div>
-              </div>
-
+            {derivSession.connected ? (
+              <span
+                className={`rounded px-2 py-0.5 text-[11px] font-bold uppercase ${
+                  derivSession.activeIsVirtual
+                    ? 'bg-[#0866FF]/15 text-[#0866FF]'
+                    : 'bg-[#FF444F]/15 text-[#FF444F]'
+                }`}
+              >
+                {derivSession.activeIsVirtual ? 'DEMO' : 'REAL'}
+              </span>
+            ) : (
               <button
                 type="button"
-                onClick={handleFetchQuote}
-                disabled={proposalBusy}
-                className="w-full py-2 px-3 text-xs font-semibold rounded-md border border-[#0866FF] text-[#0866FF] hover:bg-[#0866FF]/10 transition-colors"
+                onClick={onOpenConnect}
+                className="rounded bg-[#0866FF] px-2.5 py-1 text-xs font-semibold text-white hover:bg-[#0654D4]"
               >
-                {proposalBusy ? 'Fetching Live Deriv Quote…' : 'Check Live Deriv Payout'}
+                Connect
               </button>
+            )}
+          </div>
 
-              {proposal && (
-                <div className="p-3 rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30] text-xs space-y-1 font-mono tabular-nums">
-                  <div className="flex justify-between">
-                    <span className="text-[#6B7280]">Ask Price</span>
-                    <span className="font-semibold">${proposal.askPrice.toFixed(2)}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-[#6B7280]">Broker Payout</span>
-                    <span className="font-semibold text-[#00A88F]">${proposal.payout.toFixed(2)}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-[#6B7280]">Break-Even Win %</span>
-                    <span className="font-semibold">{proposal.breakEvenProbPct}%</span>
-                  </div>
-                </div>
-              )}
-
-              <button
-                type="button"
-                onClick={handleOpenPaperTrade}
-                disabled={tradeBusy}
-                className="w-full py-2.5 px-4 text-xs font-semibold rounded-md bg-[#00A88F] hover:bg-[#00927C] text-white transition-colors flex items-center justify-center gap-2"
-              >
-                {contractType === 'PUT' ? <ArrowDownRight className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
-                {tradeBusy ? 'Opening…' : 'Open Paper Trade (Virtual)'}
-              </button>
-
-              {tradeMsg && <p className="text-xs text-[#6B7280] dark:text-[#D1D5DB]">{tradeMsg}</p>}
+          {derivSession.connected && derivSession.accounts.length > 1 && (
+            <div className="flex flex-wrap gap-1.5">
+              {derivSession.accounts.map((acc) => {
+                const isActive = acc.loginid === derivSession.activeLoginId;
+                return (
+                  <button
+                    key={acc.loginid}
+                    type="button"
+                    onClick={() => void dqiApi.switchDerivAccount(acc.loginid)}
+                    className={`flex-1 min-w-[110px] rounded border px-2 py-1.5 text-left text-[11px] transition-colors ${
+                      isActive
+                        ? acc.isVirtual
+                          ? 'border-[#0866FF] bg-[#0866FF]/10 text-[#0866FF]'
+                          : 'border-[#FF444F] bg-[#FF444F]/10 text-[#FF444F]'
+                        : 'border-[#E5E9EF] dark:border-[#2A2D30] text-[#6B7280]'
+                    }`}
+                  >
+                    <div className="font-bold">
+                      {acc.isVirtual ? 'DEMO' : 'REAL'} · {acc.loginid}
+                    </div>
+                    <div className="font-mono tabular-nums">
+                      {acc.balance !== null ? acc.balance.toFixed(2) : '—'} {acc.currency}
+                    </div>
+                  </button>
+                );
+              })}
             </div>
           )}
+
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-[#6B7280] mb-1">Contract Type</label>
+              <select
+                value={contractType}
+                onChange={(e) => {
+                  setContractType(e.target.value);
+                  setProposal(null);
+                }}
+                className="w-full px-3 py-2 text-xs rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30] text-[#20242B] dark:text-white"
+              >
+                <option value="CALL">Rise (CALL)</option>
+                <option value="PUT">Fall (PUT)</option>
+                <option value="DIGITMATCH" disabled={contracts ? !contracts.supportsMatch : false}>
+                  Digit Matches {contracts && !contracts.supportsMatch ? '(Unsupported)' : ''}
+                </option>
+                <option value="DIGITDIFF" disabled={contracts ? !contracts.supportsDiffer : false}>
+                  Digit Differs {contracts && !contracts.supportsDiffer ? '(Unsupported)' : ''}
+                </option>
+                <option value="DIGITEVEN" disabled={contracts ? !contracts.supportsEvenOdd : false}>
+                  Digit Even
+                </option>
+                <option value="DIGITODD" disabled={contracts ? !contracts.supportsEvenOdd : false}>
+                  Digit Odd
+                </option>
+                <option value="DIGITOVER">Digit Over</option>
+                <option value="DIGITUNDER">Digit Under</option>
+              </select>
+            </div>
+
+            {(contractType === 'DIGITMATCH' ||
+              contractType === 'DIGITDIFF' ||
+              contractType === 'DIGITOVER' ||
+              contractType === 'DIGITUNDER') && (
+              <div>
+                <label className="block text-xs font-medium text-[#6B7280] mb-1">Target Digit (0–9)</label>
+                <div className="grid grid-cols-5 gap-1">
+                  {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => (
+                    <button
+                      key={d}
+                      type="button"
+                      onClick={() => setBarrier(String(d))}
+                      className={`py-1.5 text-xs font-mono font-semibold rounded border ${
+                        barrier === String(d)
+                          ? 'bg-[#0866FF] text-white border-[#0866FF]'
+                          : 'bg-[#F5F7FA] dark:bg-[#1D1F20] border-[#E5E9EF] dark:border-[#2A2D30] text-[#20242B] dark:text-white'
+                      }`}
+                    >
+                      {d}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium text-[#6B7280] mb-1">
+                  Stake ({derivSession.activeCurrency || 'USD'})
+                </label>
+                <input
+                  type="number"
+                  min="0.35"
+                  step="0.5"
+                  value={stake}
+                  onChange={(e) => setStake(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono tabular-nums rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30]"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-[#6B7280] mb-1">Duration (Ticks)</label>
+                <input
+                  type="number"
+                  min="1"
+                  max={contractType.startsWith('DIGIT') ? 10 : 500}
+                  value={durationSec}
+                  onChange={(e) => setDurationSec(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono tabular-nums rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30]"
+                />
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleFetchQuote}
+              disabled={proposalBusy}
+              className="w-full py-2 px-3 text-xs font-semibold rounded-md border border-[#0866FF] text-[#0866FF] hover:bg-[#0866FF]/10 transition-colors"
+            >
+              {proposalBusy ? 'Fetching Live Deriv Quote…' : 'Refresh Live Deriv Payout'}
+            </button>
+
+            {proposal && (
+              <div className="p-3 rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] border border-[#E5E9EF] dark:border-[#2A2D30] text-xs space-y-1 font-mono tabular-nums">
+                <div className="flex justify-between">
+                  <span className="text-[#6B7280]">Ask Stake</span>
+                  <span className="font-semibold">${proposal.askPrice.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-[#6B7280]">Return Payout</span>
+                  <span className="font-semibold text-[#00A88F]">${proposal.payout.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-[#6B7280]">Break-Even Win %</span>
+                  <span className="font-semibold">{proposal.breakEvenProbPct}%</span>
+                </div>
+              </div>
+            )}
+
+            {derivSession.connected && !derivSession.activeIsVirtual && (
+              <label className="flex items-start gap-2 rounded-md border border-[#FF444F]/40 bg-[#FF444F]/10 p-2.5 text-[11px] text-[#20242B] dark:text-[#F2F3F4]">
+                <input
+                  type="checkbox"
+                  checked={realConfirm}
+                  onChange={(e) => setRealConfirm(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>
+                  Confirm Real-Money trade on <strong>{derivSession.activeLoginId}</strong> ({derivSession.activeCurrency})
+                </span>
+              </label>
+            )}
+
+            {derivSession.connected ? (
+              <button
+                type="button"
+                onClick={handleBuyDerivContract}
+                disabled={tradeBusy || (!derivSession.activeIsVirtual && !realConfirm)}
+                className={`w-full py-2.5 px-4 text-xs font-semibold rounded-md text-white transition-colors flex items-center justify-center gap-2 disabled:opacity-50 ${
+                  derivSession.activeIsVirtual
+                    ? 'bg-[#0866FF] hover:bg-[#0654D4]'
+                    : 'bg-[#FF444F] hover:bg-[#e53843]'
+                }`}
+              >
+                {contractType === 'PUT' ? <ArrowDownRight className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
+                {tradeBusy
+                  ? 'Sending Order…'
+                  : `Buy on Deriv ${derivSession.activeIsVirtual ? 'Demo' : 'REAL'} (${derivSession.activeLoginId})`}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={onOpenConnect}
+                className="w-full py-2.5 px-4 text-xs font-semibold rounded-md bg-[#0866FF] hover:bg-[#0654D4] text-white transition-colors flex items-center justify-center gap-2"
+              >
+                <Wallet className="w-4 h-4" />
+                Connect Deriv Demo / Real to Trade
+              </button>
+            )}
+
+            {tradeMsg && (
+              <div className="p-2.5 rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] text-xs text-[#20242B] dark:text-[#D1D5DB] flex items-start gap-1.5">
+                <ShieldAlert className="w-3.5 h-3.5 mt-0.5 shrink-0 text-[#0866FF]" />
+                <span>{tradeMsg}</span>
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* Paper Account Balance & Open Positions */}
+        {/* Live Connected Account Balance & Tick-by-Tick Contracts */}
         <div className="bg-white dark:bg-[#151717] border border-[#E5E9EF] dark:border-[#2A2D30] rounded-lg p-4 space-y-3">
           <div className="flex items-center justify-between">
             <div>
-              <h3 className="text-xs font-semibold text-[#20242B] dark:text-white">Paper Balance (Virtual)</h3>
+              <h3 className="text-xs font-semibold text-[#20242B] dark:text-white">
+                {derivSession.connected
+                  ? `${derivSession.activeIsVirtual ? 'Deriv Demo' : 'Deriv REAL'} Balance`
+                  : 'Deriv Account'}
+              </h3>
               <div className="text-lg font-bold font-mono tabular-nums text-[#20242B] dark:text-white">
-                ${paperAccount ? paperAccount.current_equity.toFixed(2) : '10000.00'}
+                {derivSession.connected && derivSession.activeBalance !== null
+                  ? `${derivSession.activeBalance.toFixed(2)} ${derivSession.activeCurrency}`
+                  : 'Not connected'}
               </div>
             </div>
             <div className="text-right text-xs font-mono tabular-nums">
-              <div className="text-[#6B7280]">Net P/L</div>
-              <div className={(paperAccount?.metrics.net_profit ?? 0) >= 0 ? 'text-[#00A88F] font-semibold' : 'text-[#FF4D5A] font-semibold'}>
-                {(paperAccount?.metrics.net_profit ?? 0) >= 0 ? '+' : ''}
-                ${(paperAccount?.metrics.net_profit ?? 0).toFixed(2)}
-              </div>
+              <div className="text-[#6B7280]">Live Open P&amp;L</div>
+              {(() => {
+                const openTotal = liveContracts.reduce((s, c) => s + (c.isSold ? 0 : c.profit), 0);
+                return (
+                  <div className={openTotal >= 0 ? 'text-[#00A88F] font-semibold' : 'text-[#FF4D5A] font-semibold'}>
+                    {openTotal >= 0 ? '+' : ''}
+                    ${openTotal.toFixed(2)}
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
-          <div className="border-t border-[#E5E9EF] dark:border-[#2A2D30] pt-3 space-y-2 max-h-[260px] overflow-y-auto">
-            {positions.length === 0 ? (
+          <div className="border-t border-[#E5E9EF] dark:border-[#2A2D30] pt-3 space-y-2 max-h-[280px] overflow-y-auto">
+            {liveContracts.length === 0 ? (
               <div className="text-xs text-[#6B7280] py-4 text-center flex flex-col items-center gap-1">
                 <Activity className="w-4 h-4" />
-                No paper trades yet.
+                Live contracts stream tick-by-tick P&amp;L here.
               </div>
             ) : (
-              positions.slice(0, 8).map((p) => {
-                const canSettle = p.status === 'OPEN' && Date.now() >= new Date(p.expires_at).getTime();
+              liveContracts.slice(0, 8).map((c) => {
+                const winning = c.profit >= 0;
                 return (
                   <div
-                    key={p.position_id}
+                    key={c.contractId}
                     className="p-2.5 rounded-md bg-[#F5F7FA] dark:bg-[#1D1F20] flex items-center justify-between gap-2 text-xs"
                   >
                     <div className="min-w-0">
                       <div className="font-semibold text-[#20242B] dark:text-white truncate">
-                        {p.symbol_code} · {p.contract_type}
-                        {p.barrier ? ` (${p.barrier})` : ''}
+                        {c.symbol} · {c.contractType}
                       </div>
                       <div className="text-[11px] font-mono text-[#6B7280]">
-                        Stake ${p.stake.toFixed(2)} · Entry {p.entry_quote_str}
+                        Spot {c.currentSpot ?? c.entrySpot ?? '—'} · Stake ${c.buyPrice.toFixed(2)}
                       </div>
                     </div>
-                    {p.status === 'OPEN' ? (
-                      <button
-                        type="button"
-                        disabled={!canSettle || tradeBusy}
-                        onClick={() => handleSettle(p.position_id)}
-                        className={`px-2.5 py-1 rounded text-[11px] font-medium shrink-0 flex items-center gap-1 ${
-                          canSettle
-                            ? 'bg-[#0866FF] text-white hover:bg-[#0654D4]'
-                            : 'bg-[#E5E9EF] dark:bg-[#2A2D30] text-[#6B7280]'
+                    <div className="text-right shrink-0 space-y-1">
+                      <div
+                        className={`font-mono font-semibold tabular-nums ${
+                          winning ? 'text-[#00A88F]' : 'text-[#FF4D5A]'
                         }`}
                       >
-                        <Clock className="w-3 h-3" />
-                        {canSettle ? 'Settle' : 'Wait'}
-                      </button>
-                    ) : (
-                      <span
-                        className={`font-mono font-semibold tabular-nums shrink-0 ${
-                          (p.profit_loss ?? 0) >= 0 ? 'text-[#00A88F]' : 'text-[#FF4D5A]'
-                        }`}
-                      >
-                        {(p.profit_loss ?? 0) >= 0 ? '+' : ''}
-                        ${(p.profit_loss ?? 0).toFixed(2)}
-                      </span>
-                    )}
+                        {winning ? '+' : ''}
+                        ${c.profit.toFixed(2)}
+                      </div>
+                      {!c.isSold && !c.isExpired && c.bidPrice > 0 && (
+                        <button
+                          type="button"
+                          disabled={tradeBusy}
+                          onClick={() => handleSellEarly(c.contractId)}
+                          className="px-2 py-0.5 rounded bg-[#0866FF] text-white text-[10px] font-semibold hover:bg-[#0654D4]"
+                        >
+                          Sell ${c.bidPrice.toFixed(2)}
+                        </button>
+                      )}
+                      {c.isSold && (
+                        <span className="block text-[10px] uppercase font-bold text-[#6B7280]">
+                          {c.status}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 );
               })

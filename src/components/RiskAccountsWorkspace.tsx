@@ -6,6 +6,7 @@ import {
   ExternalLink,
   KeyRound,
   Lock,
+  LogOut,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
@@ -13,10 +14,11 @@ import {
   Unlock,
 } from 'lucide-react';
 import { dqiApi } from '../services/dqiApi';
-import type { BoundedRecoveryPolicy, PaperAccount } from '../types/dqi';
+import type { BoundedRecoveryPolicy, DerivSessionState, PaperAccount } from '../types/dqi';
 
 interface RiskAccountsWorkspaceProps {
   paperAccount: PaperAccount | null;
+  derivSession: DerivSessionState;
   onRefreshSystem: () => void;
 }
 
@@ -32,7 +34,7 @@ const MODE_OPTIONS: Array<{
 ];
 
 export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
-  paperAccount,
+  derivSession,
   onRefreshSystem,
 }) => {
   const [loading, setLoading] = useState(true);
@@ -43,9 +45,17 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
   const [health, setHealth] = useState<Awaited<ReturnType<typeof dqiApi.getHealth>> | null>(null);
   const [migrating, setMigrating] = useState(false);
 
-  // Deriv OAuth
-  const [derivAuth, setDerivAuth] = useState<{ configured: boolean; connected: boolean; message: string } | null>(null);
+  // Deriv OAuth & API Token Login
+  const [derivAuth, setDerivAuth] = useState<{
+    configured: boolean;
+    customAppConfigured?: boolean;
+    appId?: string;
+    message: string;
+  } | null>(null);
   const [startingOAuth, setStartingOAuth] = useState(false);
+  const [apiTokenInput, setApiTokenInput] = useState('');
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [pendingRealSwitchId, setPendingRealSwitchId] = useState<string | null>(null);
 
   // Recovery Policy
   const [policy, setPolicy] = useState<BoundedRecoveryPolicy | null>(null);
@@ -79,6 +89,7 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
       ]);
       setHealth(h);
       setDerivAuth(da);
+      if (da.appId) dqiApi.setDerivAppId(da.appId);
       setPolicy(rec.policy);
       setServerWorstCase(rec.worstCaseAdditionalLossPreview);
       setDeploymentRecoveryFlag(rec.deploymentRecoveryFlag);
@@ -132,7 +143,7 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
     }
   };
 
-  const handleConnectDeriv = async () => {
+  const handleConnectDerivOAuth = async () => {
     setStartingOAuth(true);
     setError(null);
     try {
@@ -144,17 +155,61 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
     }
   };
 
-  const handleKillSwitch = async () => {
+  const handleConnectApiToken = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!apiTokenInput.trim()) return;
+    setTokenBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const st = await dqiApi.authorizeDerivToken(apiTokenInput.trim());
+      setApiTokenInput('');
+      setNotice(
+        `Connected ${st.activeIsVirtual ? 'Deriv Demo' : 'Deriv REAL'} account (${st.activeLoginId}) with live balance ${st.activeBalance?.toFixed(2)} ${st.activeCurrency}.`
+      );
+      onRefreshSystem();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Invalid or unauthorized Deriv API Token');
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+
+  const handleSwitchAccount = async (loginid: string, isVirtual: boolean) => {
+    if (!isVirtual && pendingRealSwitchId !== loginid) {
+      setPendingRealSwitchId(loginid);
+      return;
+    }
+    setPendingRealSwitchId(null);
+    setError(null);
+    setNotice(null);
+    try {
+      const st = await dqiApi.switchDerivAccount(loginid);
+      setNotice(
+        `Switched active account to ${st.activeIsVirtual ? 'Demo' : 'REAL'} (${st.activeLoginId}).`
+      );
+      onRefreshSystem();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to switch account');
+    }
+  };
+
+  const handleKillSwitchToggle = async () => {
     setKilling(true);
     setError(null);
     setNotice(null);
     try {
-      await dqiApi.activateKillSwitch();
-      setNotice('Emergency Kill Switch activated. Automation and live execution halted.');
+      if (liveControl?.control.kill_switch) {
+        await dqiApi.resetKillSwitch();
+        setNotice('Kill switch reset to READY.');
+      } else {
+        await dqiApi.activateKillSwitch();
+        setNotice('Emergency Kill Switch activated. Automation halted.');
+      }
       await loadAll();
       onRefreshSystem();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Kill switch failed');
+      setError(err instanceof Error ? err.message : 'Kill switch update failed');
     } finally {
       setKilling(false);
     }
@@ -227,11 +282,7 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
       {error && (
         <div className="flex items-center justify-between gap-3 rounded-lg border border-[#FF444F]/40 bg-[#FF444F]/10 px-4 py-2.5 text-sm text-[#FF444F]">
           <span>{error}</span>
-          <button
-            type="button"
-            onClick={() => setError(null)}
-            className="text-xs font-semibold underline"
-          >
+          <button type="button" onClick={() => setError(null)} className="text-xs font-semibold underline">
             Dismiss
           </button>
         </div>
@@ -240,19 +291,133 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
       {notice && (
         <div className="flex items-center justify-between gap-3 rounded-lg border border-[#00A88F]/40 bg-[#00A88F]/10 px-4 py-2.5 text-sm text-[#00A88F]">
           <span>{notice}</span>
-          <button
-            type="button"
-            onClick={() => setNotice(null)}
-            className="text-xs font-semibold underline"
-          >
+          <button type="button" onClick={() => setNotice(null)} className="text-xs font-semibold underline">
             Dismiss
           </button>
         </div>
       )}
 
-      {/* Top Row: Emergency Kill Switch + Accounts Summary */}
+      {/* Top Row: Live Deriv Demo/Real Accounts + Safety Gate + Database */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        {/* Emergency Kill Switch & Live Execution Gate */}
+        {/* Live Deriv Demo & Real Accounts Card */}
+        <div className="rounded-lg border border-[#E5E9EF] bg-white p-4 dark:border-[#243040] dark:bg-[#151D27]">
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-[#20242B] dark:text-[#F3F4F6]">
+                Deriv Demo &amp; Real Accounts
+              </h2>
+              <p className="mt-0.5 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                Trade live on Demo first, then switch to Real right here.
+              </p>
+            </div>
+            <ShieldCheck className="h-5 w-5 text-[#0866FF]" />
+          </div>
+
+          {derivSession.connected ? (
+            <div className="mt-3 space-y-2">
+              {derivSession.accounts.map((acct) => {
+                const isActive = acct.loginid === derivSession.activeLoginId;
+                const confirmingReal = pendingRealSwitchId === acct.loginid;
+                return (
+                  <div
+                    key={acct.loginid}
+                    className={`rounded-md border p-2.5 text-xs ${
+                      isActive
+                        ? 'border-[#0866FF] bg-[#0866FF]/8'
+                        : 'border-[#E5E9EF] bg-[#F5F7FA] dark:border-[#243040] dark:bg-[#0F151D]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <span
+                          className={`font-mono font-bold ${
+                            acct.isVirtual ? 'text-[#00A88F]' : 'text-[#FF444F]'
+                          }`}
+                        >
+                          {acct.isVirtual ? 'DEMO' : 'REAL'} · {acct.loginid}
+                        </span>
+                        <div className="mt-0.5 font-mono text-sm font-bold tabular-nums text-[#20242B] dark:text-white">
+                          {acct.balance !== null
+                            ? `${acct.balance.toFixed(2)} ${acct.currency}`
+                            : `${acct.currency} (Balance sync on switch)`}
+                        </div>
+                      </div>
+
+                      {isActive ? (
+                        <span className="font-mono text-[11px] font-bold text-[#0866FF]">ACTIVE</span>
+                      ) : acct.hasToken ? (
+                        <button
+                          type="button"
+                          onClick={() => void handleSwitchAccount(acct.loginid, acct.isVirtual)}
+                          className={`rounded px-2.5 py-1 text-[11px] font-semibold text-white ${
+                            confirmingReal
+                              ? 'bg-[#FF444F] hover:bg-[#e53843]'
+                              : 'bg-[#101820] hover:bg-[#1f2c39] dark:bg-[#0866FF]'
+                          }`}
+                        >
+                          {confirmingReal ? 'Confirm REAL Switch' : `Use ${acct.isVirtual ? 'Demo' : 'Real'}`}
+                        </button>
+                      ) : (
+                        <span className="text-[11px] text-[#6B7280]">Add token below</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+
+              <button
+                type="button"
+                onClick={() => {
+                  dqiApi.disconnectDeriv();
+                  onRefreshSystem();
+                }}
+                className="inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-[#E5E9EF] px-3 py-1.5 text-xs font-medium text-[#6B7280] hover:bg-[#F5F7FA] dark:border-[#243040] dark:text-[#9CA3AF] dark:hover:bg-[#0F151D]"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Disconnect Deriv Session
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 rounded-md bg-[#F5F7FA] p-3 text-xs text-[#6B7280] dark:bg-[#0F151D] dark:text-[#9CA3AF]">
+              Not connected yet. Sign in with Deriv OAuth (loads Demo + Real together) OR paste your Deriv API Token below.
+            </div>
+          )}
+
+          {/* Direct API Token Login (instant connection for Demo or Real) */}
+          <form onSubmit={handleConnectApiToken} className="mt-3 space-y-2 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
+            <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+              {derivSession.connected ? 'Attach Demo/Real API Token to Switch' : 'Instant Connect via Deriv API Token'}
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={apiTokenInput}
+                onChange={(e) => setApiTokenInput(e.target.value)}
+                placeholder="Paste Deriv API Token (Read + Trade)"
+                className="min-w-0 flex-1 rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-2.5 py-1.5 text-xs text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]"
+              />
+              <button
+                type="submit"
+                disabled={tokenBusy || !apiTokenInput.trim()}
+                className="rounded-md bg-[#00A88F] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#00917b] disabled:opacity-50"
+              >
+                {tokenBusy ? 'Connecting…' : 'Connect'}
+              </button>
+            </div>
+          </form>
+
+          <button
+            type="button"
+            disabled={startingOAuth}
+            onClick={handleConnectDerivOAuth}
+            className="mt-2.5 flex w-full items-center justify-center gap-2 rounded-md bg-[#0866FF] px-4 py-2 text-xs font-semibold text-white transition hover:bg-[#0654d4] disabled:opacity-45"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            {startingOAuth ? 'Redirecting to Deriv…' : `Login with Deriv OAuth (App ${derivAuth?.appId ?? derivSession.appId})`}
+          </button>
+        </div>
+
+        {/* Emergency Kill Switch & Safety Limits */}
         <div className="rounded-lg border border-[#E5E9EF] bg-white p-4 dark:border-[#243040] dark:bg-[#151D27]">
           <div className="flex items-start justify-between gap-2">
             <div>
@@ -260,7 +425,7 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
                 Safety Gate &amp; Kill Switch
               </h2>
               <p className="mt-0.5 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                Live real-money trading is disabled by default.
+                Real-account execution requires explicit user confirmation.
               </p>
             </div>
             <ShieldAlert className="h-5 w-5 text-[#FF444F]" />
@@ -268,14 +433,30 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
 
           <div className="mt-3 space-y-2 text-xs">
             <div className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 dark:bg-[#0F151D]">
-              <span className="text-[#6B7280] dark:text-[#9CA3AF]">Deployment Live Gate</span>
-              <span className={`font-mono font-semibold ${liveControl?.deployment_gate ? 'text-[#00A88F]' : 'text-[#20242B] dark:text-[#F3F4F6]'}`}>
-                {liveControl?.deployment_gate ? 'ENABLED' : 'LOCKED (SAFE)'}
+              <span className="text-[#6B7280] dark:text-[#9CA3AF]">Active Account Mode</span>
+              <span
+                className={`font-mono font-semibold ${
+                  !derivSession.connected
+                    ? 'text-[#6B7280]'
+                    : derivSession.activeIsVirtual
+                    ? 'text-[#00A88F]'
+                    : 'text-[#FF444F]'
+                }`}
+              >
+                {!derivSession.connected
+                  ? 'NOT CONNECTED'
+                  : derivSession.activeIsVirtual
+                  ? 'DERIV DEMO'
+                  : 'DERIV REAL'}
               </span>
             </div>
             <div className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 dark:bg-[#0F151D]">
               <span className="text-[#6B7280] dark:text-[#9CA3AF]">Kill Switch State</span>
-              <span className={`font-mono font-semibold ${liveControl?.control.kill_switch ? 'text-[#FF444F]' : 'text-[#00A88F]'}`}>
+              <span
+                className={`font-mono font-semibold ${
+                  liveControl?.control.kill_switch ? 'text-[#FF444F]' : 'text-[#00A88F]'
+                }`}
+              >
                 {liveControl?.control.kill_switch ? 'TRIPPED (HALTED)' : 'READY'}
               </span>
             </div>
@@ -290,61 +471,19 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
           <button
             type="button"
             disabled={killing || loading}
-            onClick={handleKillSwitch}
-            className="mt-4 flex w-full items-center justify-center gap-2 rounded-md bg-[#FF444F] px-4 py-2.5 text-xs font-semibold text-white transition hover:bg-[#e53843] disabled:opacity-50"
+            onClick={handleKillSwitchToggle}
+            className={`mt-4 flex w-full items-center justify-center gap-2 rounded-md px-4 py-2.5 text-xs font-semibold text-white transition disabled:opacity-50 ${
+              liveControl?.control.kill_switch
+                ? 'bg-[#00A88F] hover:bg-[#00917b]'
+                : 'bg-[#FF444F] hover:bg-[#e53843]'
+            }`}
           >
             <AlertOctagon className="h-4 w-4" />
-            {killing ? 'Activating Kill Switch…' : 'Activate Emergency Kill Switch'}
-          </button>
-        </div>
-
-        {/* Paper & Deriv OAuth Accounts */}
-        <div className="rounded-lg border border-[#E5E9EF] bg-white p-4 dark:border-[#243040] dark:bg-[#151D27]">
-          <div className="flex items-start justify-between gap-2">
-            <div>
-              <h2 className="text-sm font-semibold text-[#20242B] dark:text-[#F3F4F6]">
-                Paper &amp; Deriv Accounts
-              </h2>
-              <p className="mt-0.5 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                Demo and Real balances remain strictly isolated.
-              </p>
-            </div>
-            <ShieldCheck className="h-5 w-5 text-[#0866FF]" />
-          </div>
-
-          <div className="mt-3 space-y-2 text-xs">
-            <div className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 dark:bg-[#0F151D]">
-              <span className="text-[#6B7280] dark:text-[#9CA3AF]">Local Paper Equity</span>
-              <span className="font-mono font-semibold tabular-nums text-[#00A88F]">
-                ${paperAccount ? paperAccount.current_equity.toFixed(2) : '10000.00'} USD
-              </span>
-            </div>
-            <div className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 dark:bg-[#0F151D]">
-              <span className="text-[#6B7280] dark:text-[#9CA3AF]">Deriv OAuth App</span>
-              <span className={`font-mono font-semibold ${derivAuth?.configured ? 'text-[#00A88F]' : 'text-[#6B7280]'}`}>
-                {derivAuth?.configured ? 'CONFIGURED' : 'NOT SET'}
-              </span>
-            </div>
-            <div className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 dark:bg-[#0F151D]">
-              <span className="text-[#6B7280] dark:text-[#9CA3AF]">Deriv Connection</span>
-              <span className={`font-mono font-semibold ${derivAuth?.connected ? 'text-[#00A88F]' : 'text-[#20242B] dark:text-[#F3F4F6]'}`}>
-                {derivAuth?.connected ? 'CONNECTED' : 'PAPER MODE'}
-              </span>
-            </div>
-          </div>
-
-          <div className="mt-3 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-            {derivAuth?.message || 'Configure DERIV_CLIENT_ID and DERIV_REDIRECT_URI to connect your Deriv account via OAuth PKCE.'}
-          </div>
-
-          <button
-            type="button"
-            disabled={!derivAuth?.configured || startingOAuth}
-            onClick={handleConnectDeriv}
-            className="mt-3 flex w-full items-center justify-center gap-2 rounded-md bg-[#0866FF] px-4 py-2 text-xs font-semibold text-white transition hover:bg-[#0654d4] disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-            {startingOAuth ? 'Redirecting to Deriv…' : derivAuth?.connected ? 'Reconnect Deriv OAuth' : 'Connect Deriv Account'}
+            {killing
+              ? 'Updating…'
+              : liveControl?.control.kill_switch
+              ? 'Reset Kill Switch to Ready'
+              : 'Activate Emergency Kill Switch'}
           </button>
         </div>
 
@@ -356,7 +495,7 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
                 Database &amp; Admin Lock
               </h2>
               <p className="mt-0.5 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                Neon PostgreSQL migrations &amp; session control.
+                Neon PostgreSQL migrations &amp; Vercel env check.
               </p>
             </div>
             <Database className="h-5 w-5 text-[#08B9E6]" />
@@ -376,6 +515,12 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
               </span>
             </div>
           </div>
+
+          {health && !health.database.configured && (
+            <p className="mt-2 text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+              If you added <code className="font-mono">DATABASE_URL</code> in Vercel Settings, trigger a <strong>Redeploy</strong> in Vercel so this deployment loads the new environment variables.
+            </p>
+          )}
 
           <button
             type="button"
@@ -476,7 +621,6 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
 
         {policy && (
           <div className="mt-4 space-y-4">
-            {/* Mode cards */}
             <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
               {MODE_OPTIONS.map((opt) => {
                 const active = policy.mode === opt.value;
@@ -504,11 +648,10 @@ export const RiskAccountsWorkspace: React.FC<RiskAccountsWorkspaceProps> = ({
 
             {!deploymentRecoveryFlag && policy.mode !== 'OFF' && (
               <div className="rounded-md border border-[#FFAD3A]/40 bg-[#FFAD3A]/10 px-3 py-2 text-xs text-[#9A5B00] dark:text-[#FFAD3A]">
-                Note: Deployment flag <code className="font-mono">ENABLE_BOUNDED_RECOVERY=true</code> is required before recovery triggers on live sessions. Paper simulation settings remain saved.
+                Note: Deployment flag <code className="font-mono">DQI_RECOVERY_ENABLED=true</code> is required before recovery triggers automatically.
               </div>
             )}
 
-            {/* Numeric cap controls */}
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
               <label className="block text-xs">
                 <span className="text-[#6B7280] dark:text-[#9CA3AF]">Max Attempts / Session</span>

@@ -12,16 +12,17 @@ import {
   RefreshCw,
   ShieldCheck,
   Sparkles,
+  Wallet,
 } from 'lucide-react';
 import { dqiApi } from '../services/dqiApi';
 import type {
   ActiveSymbol,
   AiAnalyzeBrief,
+  DerivSessionState,
   DigitsFullResponse,
   DqiTab,
+  LiveDerivContract,
   LiveTickEvent,
-  PaperAccount,
-  PaperPosition,
   QuantAnalysis,
 } from '../types/dqi';
 
@@ -31,9 +32,10 @@ interface AnalyserBotWorkspaceProps {
   onSelectSymbol: (symbol: string) => void;
   latestTick: LiveTickEvent | null;
   liveTapeBuffer: LiveTickEvent[];
-  paperAccount: PaperAccount | null;
+  derivSession: DerivSessionState;
+  liveContracts: LiveDerivContract[];
+  onOpenConnect: () => void;
   onJumpToTab: (tab: DqiTab) => void;
-  onRefreshSystem: () => void;
 }
 
 const BEGINNER_MARKETS = [
@@ -43,7 +45,7 @@ const BEGINNER_MARKETS = [
   { code: 'R_10', label: 'Volatility 10' },
 ];
 
-const STAKE_PRESETS = [1, 2, 5];
+const STAKE_PRESETS = [0.5, 1, 2, 5];
 
 function friendlyVolatility(regime: string | undefined): { label: string; hint: string } {
   switch (regime) {
@@ -56,7 +58,7 @@ function friendlyVolatility(regime: string | undefined): { label: string; hint: 
     case 'EXTREME':
       return { label: 'Fast / Volatile', hint: 'Larger price jumps — use small stakes' };
     default:
-      return { label: 'Loading Speed', hint: 'Gathering live ticks' };
+      return { label: 'Live Tick Flow', hint: 'Tracking incoming ticks' };
   }
 }
 
@@ -66,9 +68,10 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   onSelectSymbol,
   latestTick,
   liveTapeBuffer,
-  paperAccount,
+  derivSession,
+  liveContracts,
+  onOpenConnect,
   onJumpToTab,
-  onRefreshSystem,
 }) => {
   const [tickWindow, setTickWindow] = useState(100);
   const [chartTimeframe, setChartTimeframe] = useState('M5');
@@ -83,35 +86,40 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
-  // Beginner-friendly virtual practice trade box
-  const [practiceType, setPracticeType] = useState<'CALL' | 'PUT' | 'DIGITEVEN' | 'DIGITODD' | 'DIGITDIFF'>('CALL');
-  const [practiceDigit, setPracticeDigit] = useState<number>(0);
-  const [practiceStake, setPracticeStake] = useState<number>(1);
-  const [practiceBusy, setPracticeBusy] = useState(false);
-  const [practiceMsg, setPracticeMsg] = useState<string | null>(null);
-  const [positions, setPositions] = useState<PaperPosition[]>([]);
+  // Real Deriv Trade Box (Demo VRTC or Real CR)
+  const [tradeType, setTradeType] = useState<'CALL' | 'PUT' | 'DIGITEVEN' | 'DIGITODD' | 'DIGITDIFF'>('CALL');
+  const [tradeDigit, setTradeDigit] = useState<number>(0);
+  const [tradeStake, setTradeStake] = useState<number>(1);
+  const [tradeDuration, setTradeDuration] = useState<number>(5);
+  const [tradeUnit, setTradeUnit] = useState<'t' | 's'>('t');
+  const [liveProposal, setLiveProposal] = useState<{
+    askPrice: number;
+    payout: number;
+    breakEvenProbPct: number | null;
+  } | null>(null);
+  const [tradeBusy, setTradeBusy] = useState(false);
+  const [tradeMsg, setTradeMsg] = useState<string | null>(null);
+  const [realTradeConfirm, setRealTradeConfirm] = useState(false);
 
   const loadAnalysis = useCallback(async () => {
     setLoadingData(true);
     setDataError(null);
     try {
-      const [digRes, qRes, posRes] = await Promise.all([
-        dqiApi.analyzeDigits(selectedSymbol, tickWindow, practiceStake, 1).catch(() => null),
+      const [digRes, qRes] = await Promise.all([
+        dqiApi.analyzeDigits(selectedSymbol, tickWindow, tradeStake, 1).catch(() => null),
         dqiApi.analyzeQuant(selectedSymbol, chartTimeframe, 160).catch(() => null),
-        dqiApi.getPaperPositions().catch(() => ({ positions: [] })),
       ]);
       if (!digRes && !qRes) {
-        throw new Error('Waiting for live Deriv market connection. Check your network and tap Refresh.');
+        throw new Error('Waiting for Deriv public WebSocket response. Tap Refresh to retry.');
       }
       if (digRes) setDigitsData(digRes);
       if (qRes) setQuantData(qRes);
-      setPositions(posRes.positions.slice(0, 4));
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Unable to analyze market');
     } finally {
       setLoadingData(false);
     }
-  }, [selectedSymbol, tickWindow, chartTimeframe, practiceStake]);
+  }, [selectedSymbol, tickWindow, chartTimeframe, tradeStake]);
 
   useEffect(() => {
     setAiBrief(null);
@@ -119,23 +127,120 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     void loadAnalysis();
   }, [loadAnalysis]);
 
-  // Keep live tape responsive between full reloads
+  // Live proposal calculation whenever contract type, digit, stake, or duration changes
+  useEffect(() => {
+    let cancelled = false;
+    const isDigit = tradeType === 'DIGITEVEN' || tradeType === 'DIGITODD' || tradeType === 'DIGITDIFF';
+    const dur = isDigit ? Math.min(10, Math.max(1, tradeDuration)) : tradeDuration;
+    const unit = isDigit ? 't' : tradeUnit;
+    void dqiApi
+      .getProposal({
+        symbol: selectedSymbol,
+        contractType: tradeType,
+        amount: tradeStake,
+        duration: dur,
+        durationUnit: unit,
+        barrier: tradeType === 'DIGITDIFF' ? String(tradeDigit) : undefined,
+      })
+      .then((p) => {
+        if (!cancelled) {
+          setLiveProposal({
+            askPrice: p.askPrice,
+            payout: p.payout,
+            breakEvenProbPct: p.breakEvenProbPct,
+          });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setLiveProposal(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSymbol, tradeType, tradeDigit, tradeStake, tradeDuration, tradeUnit]);
+
   const displayQuote = latestTick?.rawQuote ?? digitsData?.analytics.latestQuote ?? null;
   const displayDigit = latestTick?.lastDigit ?? digitsData?.analytics.latestObservedDigit ?? null;
 
-  const recentDigits = useMemo(() => {
-    if (liveTapeBuffer.length >= 12) {
-      return liveTapeBuffer.slice(-20).map((t) => ({ digit: t.lastDigit, quote: t.rawQuote }));
-    }
-    return (digitsData?.analytics.tape ?? []).slice(-20).map((t) => ({ digit: t.digit, quote: t.quote }));
-  }, [liveTapeBuffer, digitsData]);
+  // REAL-TIME tick-by-tick digit frequency calculation (combines initial history + live streaming ticks)
+  const liveDigitsComputation = useMemo(() => {
+    const baseTape = (digitsData?.analytics.tape ?? []).map((t) => ({
+      digit: t.digit,
+      quote: t.quote,
+      epoch: t.epoch,
+    }));
+    const liveItems = liveTapeBuffer.map((t) => ({
+      digit: t.lastDigit,
+      quote: t.rawQuote,
+      epoch: t.epoch,
+    }));
 
-  // Deterministic plain-English live summary from real telemetry
+    // Merge without duplicates and slice to selected tickWindow
+    const seen = new Set<string>();
+    const merged: Array<{ digit: number; quote: string; epoch: number }> = [];
+    for (const item of [...baseTape, ...liveItems]) {
+      const key = `${item.epoch}:${item.quote}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(item);
+      }
+    }
+    const windowSlice = merged.slice(-tickWindow);
+    const total = windowSlice.length;
+
+    if (total === 0) {
+      return {
+        total: 0,
+        evenPct: 50,
+        oddPct: 50,
+        over4Pct: 50,
+        under5Pct: 50,
+        digits: Array.from({ length: 10 }, (_, d) => ({ digit: d, count: 0, percentage: 0 })),
+        tape20: [] as Array<{ digit: number; quote: string; epoch: number }>,
+      };
+    }
+
+    const counts = Array.from({ length: 10 }, () => 0);
+    let even = 0;
+    let over4 = 0;
+    for (const row of windowSlice) {
+      counts[row.digit] += 1;
+      if (row.digit % 2 === 0) even += 1;
+      if (row.digit > 4) over4 += 1;
+    }
+
+    return {
+      total,
+      evenPct: (even / total) * 100,
+      oddPct: ((total - even) / total) * 100,
+      over4Pct: (over4 / total) * 100,
+      under5Pct: ((total - over4) / total) * 100,
+      digits: counts.map((count, digit) => ({
+        digit,
+        count,
+        percentage: (count / total) * 100,
+      })),
+      tape20: windowSlice.slice(-20),
+    };
+  }, [digitsData, liveTapeBuffer, tickWindow]);
+
+  const hottestDigit = useMemo(() => {
+    if (liveDigitsComputation.total === 0) return null;
+    const top = [...liveDigitsComputation.digits].sort((a, b) => b.count - a.count)[0];
+    return { digit: top.digit, pct: top.percentage };
+  }, [liveDigitsComputation]);
+
+  const coldestDigit = useMemo(() => {
+    if (liveDigitsComputation.total === 0) return null;
+    const low = [...liveDigitsComputation.digits].sort((a, b) => a.count - b.count)[0];
+    return { digit: low.digit, pct: low.percentage };
+  }, [liveDigitsComputation]);
+
   const deterministicVerdict = useMemo(() => {
     const dir = quantData?.direction;
     const conf = quantData ? Math.round(quantData.calibrated_confidence * 100) : 0;
-    const evenPct = digitsData?.analytics.evenPct ?? 50;
-    const overPct = digitsData?.analytics.over4Pct ?? 50;
+    const evenPct = liveDigitsComputation.evenPct;
+    const overPct = liveDigitsComputation.over4Pct;
 
     if (dir === 'BUY' && conf >= 58) {
       return {
@@ -151,15 +256,15 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         reason: 'Recent candles show downward momentum below short-term average.',
       };
     }
-    if (Math.abs(evenPct - 50) >= 8) {
+    if (Math.abs(evenPct - 50) >= 8 && liveDigitsComputation.total >= 20) {
       const side = evenPct > 50 ? 'Even' : 'Odd';
       return {
         title: `${side} Digits Active (${Math.max(evenPct, 100 - evenPct).toFixed(0)}%)`,
         tone: 'blue' as const,
-        reason: `In the last ${digitsData?.analytics.sampleCount ?? tickWindow} ticks, ${side.toLowerCase()} digits appeared more often.`,
+        reason: `In the last ${liveDigitsComputation.total} ticks, ${side.toLowerCase()} digits appeared more often.`,
       };
     }
-    if (Math.abs(overPct - 50) >= 8) {
+    if (Math.abs(overPct - 50) >= 8 && liveDigitsComputation.total >= 20) {
       const side = overPct > 50 ? 'Over 4 (5–9)' : 'Under 5 (0–4)';
       return {
         title: `${side} Active (${Math.max(overPct, 100 - overPct).toFixed(0)}%)`,
@@ -168,27 +273,11 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       };
     }
     return {
-      title: 'Balanced Market — Wait or Practice Lightly',
+      title: 'Balanced Market — Wait or Trade Small',
       tone: 'neutral' as const,
       reason: 'Neither trend nor digit counts show a strong skew right now.',
     };
-  }, [quantData, digitsData, tickWindow]);
-
-  const sortedDigits = useMemo(() => {
-    return digitsData?.analytics.digits ?? [];
-  }, [digitsData]);
-
-  const hottestDigit = useMemo(() => {
-    if (sortedDigits.length === 0) return null;
-    const top = [...sortedDigits].sort((a, b) => b.count - a.count)[0];
-    return { digit: top.digit, pct: top.percentage };
-  }, [sortedDigits]);
-
-  const coldestDigit = useMemo(() => {
-    if (sortedDigits.length === 0) return null;
-    const low = [...sortedDigits].sort((a, b) => a.count - b.count)[0];
-    return { digit: low.digit, pct: low.percentage };
-  }, [sortedDigits]);
+  }, [quantData, liveDigitsComputation]);
 
   const handleAskAi = async () => {
     setAiLoading(true);
@@ -200,12 +289,12 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         symbol: selectedSymbol,
         spotQuote: displayQuote,
         latestDigit: displayDigit,
-        tickWindowCount: digitsData?.analytics.sampleCount ?? liveTapeBuffer.length,
-        volatilityRegime: digitsData?.volatility.regime ?? 'INSUFFICIENT_DATA',
-        evenPct: digitsData?.analytics.evenPct ?? 50,
-        oddPct: digitsData?.analytics.oddPct ?? 50,
-        over4Pct: digitsData?.analytics.over4Pct ?? 50,
-        under5Pct: digitsData?.analytics.under5Pct ?? 50,
+        tickWindowCount: liveDigitsComputation.total,
+        volatilityRegime: digitsData?.volatility.regime ?? 'NORMAL',
+        evenPct: liveDigitsComputation.evenPct,
+        oddPct: liveDigitsComputation.oddPct,
+        over4Pct: liveDigitsComputation.over4Pct,
+        under5Pct: liveDigitsComputation.under5Pct,
         hottestDigit,
         coldestDigit,
         matchBreakEvenPct: matchBe,
@@ -223,41 +312,44 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     }
   };
 
-  const handlePracticeTrade = async () => {
-    setPracticeBusy(true);
-    setPracticeMsg(null);
+  const handlePlaceDerivTrade = async () => {
+    if (!derivSession.connected) {
+      onOpenConnect();
+      return;
+    }
+    if (!derivSession.activeIsVirtual && !realTradeConfirm) {
+      setTradeMsg('Please tick the Real Account confirmation checkbox before placing a live trade.');
+      return;
+    }
+
+    setTradeBusy(true);
+    setTradeMsg(null);
     try {
-      const direction: 'BUY' | 'SELL' = practiceType === 'PUT' ? 'SELL' : 'BUY';
-      const payoutMult = practiceType === 'DIGITDIFF' ? 0.1 : 0.95;
-      const res = await dqiApi.openPaperTrade({
+      const isDigit = tradeType === 'DIGITEVEN' || tradeType === 'DIGITODD' || tradeType === 'DIGITDIFF';
+      const contract = await dqiApi.buyDerivContract({
         symbol: selectedSymbol,
-        timeframe: chartTimeframe,
-        contractType: practiceType,
-        barrier: practiceType === 'DIGITDIFF' ? String(practiceDigit) : undefined,
-        direction,
-        stake: practiceStake,
-        expiry_seconds: 15,
-        payout_multiplier: payoutMult,
+        contractType: tradeType,
+        amount: tradeStake,
+        duration: isDigit ? Math.min(10, Math.max(1, tradeDuration)) : tradeDuration,
+        durationUnit: isDigit ? 't' : tradeUnit,
+        barrier: tradeType === 'DIGITDIFF' ? String(tradeDigit) : undefined,
       });
-      setPracticeMsg(
-        `Practice ${practiceType} opened on ${selectedSymbol} for $${practiceStake}. Settles automatically or click Settle below.`
+      setRealTradeConfirm(false);
+      setTradeMsg(
+        `Opened #${contract.contractId} on ${contract.isVirtual ? 'Deriv Demo' : 'Deriv Real'} (${contract.loginid}). Live P&L updating tick-by-tick below.`
       );
-      setPositions((prev) => [res.position, ...prev].slice(0, 4));
-      onRefreshSystem();
     } catch (err) {
-      setPracticeMsg(err instanceof Error ? err.message : 'Could not open practice trade');
+      setTradeMsg(err instanceof Error ? err.message : 'Order execution failed');
     } finally {
-      setPracticeBusy(false);
+      setTradeBusy(false);
     }
   };
 
-  const handleSettle = async (id: number) => {
+  const handleSellEarly = async (contractId: number) => {
     try {
-      const res = await dqiApi.settlePaperPosition(id);
-      setPositions((prev) => prev.map((p) => (p.position_id === id ? res.position : p)));
-      onRefreshSystem();
+      await dqiApi.sellDerivContract(contractId);
     } catch (err) {
-      setPracticeMsg(err instanceof Error ? err.message : 'Settle failed — wait a few ticks and retry');
+      setTradeMsg(err instanceof Error ? err.message : 'Unable to close contract early');
     }
   };
 
@@ -266,6 +358,8 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     symbols.find((s) => s.symbol === selectedSymbol)?.display_name ||
     BEGINNER_MARKETS.find((m) => m.code === selectedSymbol)?.label ||
     selectedSymbol;
+
+  const isDigitSelected = tradeType === 'DIGITEVEN' || tradeType === 'DIGITODD' || tradeType === 'DIGITDIFF';
 
   return (
     <div className="space-y-4">
@@ -277,7 +371,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               AI Market Analyser Bot
             </h1>
             <p className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-              Pick any market below to see live prices, digit patterns, trend direction, and plain-English AI guidance.
+              Real-time Deriv quotes, tick-by-tick calculations, AI explanation, and direct Demo/Real account execution.
             </p>
           </div>
 
@@ -362,17 +456,17 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
 
       {/* Main 2-Column Easy View */}
       <div className="grid grid-cols-1 items-stretch gap-4 lg:grid-cols-12">
-        {/* LEFT (7 cols): Live Analyser Dashboard */}
+        {/* LEFT (7 cols): Live Real-Time Analyser Dashboard */}
         <div className="flex flex-col justify-between space-y-4 rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27] lg:col-span-7">
           <div>
-            {/* Live Price + Big Digit Tile + Verdict */}
+            {/* Live Price + Big Digit Tile */}
             <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#E5E9EF] pb-4 dark:border-[#243040]">
               <div>
                 <div className="text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                  {selectedMarketName} · Live Feed
+                  {selectedMarketName} · Live Tick Feed ({liveDigitsComputation.total} ticks)
                 </div>
                 <div className="mt-1 font-mono text-2xl font-bold tabular-nums text-[#20242B] dark:text-white">
-                  {displayQuote ?? 'Connecting…'}
+                  {displayQuote ?? 'Connecting to Deriv…'}
                 </div>
               </div>
 
@@ -431,71 +525,52 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </div>
             </div>
 
-            {/* Even/Odd & Over/Under Balance Bars */}
+            {/* Even/Odd & Over/Under Live Balance Bars */}
             <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
-                <div className="flex justify-between text-xs font-medium">
+                <div className="flex justify-between font-mono text-xs font-medium tabular-nums">
                   <span className="text-[#00A88F]">
-                    Even {digitsData ? `${digitsData.analytics.evenPct.toFixed(1)}%` : '—'}
+                    Even {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.evenPct.toFixed(1)}%` : '—'}
                   </span>
                   <span className="text-[#0866FF]">
-                    Odd {digitsData ? `${digitsData.analytics.oddPct.toFixed(1)}%` : '—'}
+                    Odd {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.oddPct.toFixed(1)}%` : '—'}
                   </span>
                 </div>
                 <div className="mt-1.5 flex h-2.5 overflow-hidden rounded bg-[#E5E9EF] dark:bg-[#243040]">
-                  <div
-                    className="bg-[#00A88F]"
-                    style={{ width: `${digitsData ? digitsData.analytics.evenPct : 50}%` }}
-                  />
-                  <div
-                    className="bg-[#0866FF]"
-                    style={{ width: `${digitsData ? digitsData.analytics.oddPct : 50}%` }}
-                  />
+                  <div className="bg-[#00A88F]" style={{ width: `${liveDigitsComputation.evenPct}%` }} />
+                  <div className="bg-[#0866FF]" style={{ width: `${liveDigitsComputation.oddPct}%` }} />
                 </div>
               </div>
 
               <div>
-                <div className="flex justify-between text-xs font-medium">
+                <div className="flex justify-between font-mono text-xs font-medium tabular-nums">
                   <span className="text-[#08B9E6]">
-                    Over 4 {digitsData ? `${digitsData.analytics.over4Pct.toFixed(1)}%` : '—'}
+                    Over 4 {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.over4Pct.toFixed(1)}%` : '—'}
                   </span>
                   <span className="text-[#FF4D5A]">
-                    Under 5 {digitsData ? `${digitsData.analytics.under5Pct.toFixed(1)}%` : '—'}
+                    Under 5 {liveDigitsComputation.total > 0 ? `${liveDigitsComputation.under5Pct.toFixed(1)}%` : '—'}
                   </span>
                 </div>
                 <div className="mt-1.5 flex h-2.5 overflow-hidden rounded bg-[#E5E9EF] dark:bg-[#243040]">
-                  <div
-                    className="bg-[#08B9E6]"
-                    style={{ width: `${digitsData ? digitsData.analytics.over4Pct : 50}%` }}
-                  />
-                  <div
-                    className="bg-[#FF4D5A]"
-                    style={{ width: `${digitsData ? digitsData.analytics.under5Pct : 50}%` }}
-                  />
+                  <div className="bg-[#08B9E6]" style={{ width: `${liveDigitsComputation.over4Pct}%` }} />
+                  <div className="bg-[#FF4D5A]" style={{ width: `${liveDigitsComputation.under5Pct}%` }} />
                 </div>
               </div>
             </div>
 
-            {/* 0–9 Simple Digit Frequency Bars */}
+            {/* 0–9 Real-Time Digit Frequency Bars */}
             <div className="mt-5">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-[#20242B] dark:text-[#F3F4F6]">
-                  Last-Digit Frequency (0–9) · Click any digit to test Differ
+                  Live Last-Digit Frequency (0–9) · Click a digit to select Differ
                 </span>
                 <span className="font-mono text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                  Expected Baseline: 10.0%
+                  Baseline: 10.0%
                 </span>
               </div>
 
               <div className="mt-3 grid grid-cols-10 gap-1.5">
-                {(sortedDigits.length === 10
-                  ? sortedDigits
-                  : Array.from({ length: 10 }, (_, d) => ({
-                      digit: d,
-                      percentage: 0,
-                      count: 0,
-                    }))
-                ).map((row) => {
+                {liveDigitsComputation.digits.map((row) => {
                   const isLatest = displayDigit === row.digit;
                   const isHighest = hottestDigit?.digit === row.digit && row.count > 0;
                   const isLowest = coldestDigit?.digit === row.digit && row.count > 0;
@@ -505,8 +580,8 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                       key={row.digit}
                       type="button"
                       onClick={() => {
-                        setPracticeDigit(row.digit);
-                        setPracticeType('DIGITDIFF');
+                        setTradeDigit(row.digit);
+                        setTradeType('DIGITDIFF');
                       }}
                       className={`flex flex-col items-center rounded-md border p-1.5 transition ${
                         isLatest
@@ -537,7 +612,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 })}
               </div>
               <p className="mt-2 text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                Red bar = most common digit in this window · Green bar = least common digit. Past ticks do not guarantee future ticks.
+                Updates every tick in real time. Red = highest frequency · Green = lowest frequency. Past ticks never predict the next tick.
               </p>
             </div>
           </div>
@@ -548,14 +623,14 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               Live Tick Stream (Newest on right)
             </div>
             <div className="flex flex-wrap gap-1">
-              {recentDigits.length === 0 ? (
+              {liveDigitsComputation.tape20.length === 0 ? (
                 <span className="text-xs text-[#6B7280]">Waiting for incoming ticks…</span>
               ) : (
-                recentDigits.map((item, idx) => {
-                  const isNewest = idx === recentDigits.length - 1;
+                liveDigitsComputation.tape20.map((item, idx) => {
+                  const isNewest = idx === liveDigitsComputation.tape20.length - 1;
                   return (
                     <span
-                      key={`${idx}-${item.quote}`}
+                      key={`${item.epoch}-${idx}`}
                       title={item.quote}
                       className={`flex h-7 w-7 items-center justify-center rounded font-mono text-xs font-bold tabular-nums ${
                         isNewest
@@ -574,9 +649,9 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
           </div>
         </div>
 
-        {/* RIGHT (5 cols): AI Analyst Brief + Safe 1-Click Paper Practice */}
+        {/* RIGHT (5 cols): AI Market Brief + Live Deriv Demo / Real Trading Panel */}
         <div className="flex flex-col justify-between space-y-4 lg:col-span-5">
-          {/* AI Analyst Brief (Gemini 4 Hydrogen) */}
+          {/* AI Analyst Brief */}
           <div className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -604,7 +679,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
 
             {!aiBrief && !aiError && (
               <div className="mt-3 rounded-md bg-[#F5F7FA] p-3.5 text-xs text-[#6B7280] dark:bg-[#0F151D] dark:text-[#9CA3AF]">
-                Click <strong>Ask AI Analyst</strong> to get a beginner-friendly plain-English breakdown of the live numbers on this screen.
+                Click <strong>Ask AI Analyst</strong> for a plain-English summary of the live quotes, digit frequencies, and trend indicators.
               </div>
             )}
 
@@ -638,134 +713,238 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
             )}
           </div>
 
-          {/* 1-Click Safe Practice ($10,000 Paper Account) */}
+          {/* Real Deriv Demo / Real Live Trade Execution & Tick-by-Tick P&L */}
           <div className="flex-1 rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
-                  Practice Risk-Free
+                  {derivSession.connected
+                    ? `Trade on Deriv ${derivSession.activeIsVirtual ? 'Demo' : 'REAL'} (${derivSession.activeLoginId})`
+                    : 'Connect Deriv Account to Trade'}
                 </h2>
                 <p className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                  Virtual Balance:{' '}
-                  <span className="font-mono font-bold tabular-nums text-[#00A88F]">
-                    ${paperAccount ? paperAccount.current_equity.toFixed(2) : '10000.00'}
-                  </span>
+                  {derivSession.connected ? (
+                    <>
+                      Live Balance:{' '}
+                      <span
+                        className={`font-mono font-bold tabular-nums ${
+                          derivSession.activeIsVirtual ? 'text-[#00A88F]' : 'text-[#FF444F]'
+                        }`}
+                      >
+                        {derivSession.activeBalance !== null
+                          ? `${derivSession.activeBalance.toFixed(2)} ${derivSession.activeCurrency}`
+                          : 'Loading…'}
+                      </span>
+                    </>
+                  ) : (
+                    'Log in with Deriv OAuth or API Token to trade live Demo first, then switch to Real.'
+                  )}
                 </p>
               </div>
-              <CheckCircle2 className="h-4 w-4 text-[#00A88F]" />
+              {derivSession.connected ? (
+                <CheckCircle2 className="h-4 w-4 text-[#00A88F]" />
+              ) : (
+                <Wallet className="h-4 w-4 text-[#0866FF]" />
+              )}
             </div>
 
-            <div className="mt-3 space-y-3">
-              <div>
-                <div className="mb-1.5 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                  1. Choose Trade Type
-                </div>
-                <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-5">
-                  {(
-                    [
-                      { id: 'CALL', label: 'Rise' },
-                      { id: 'PUT', label: 'Fall' },
-                      { id: 'DIGITEVEN', label: 'Even' },
-                      { id: 'DIGITODD', label: 'Odd' },
-                      { id: 'DIGITDIFF', label: `Diff ${practiceDigit}` },
-                    ] as const
-                  ).map((opt) => (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => setPracticeType(opt.id)}
-                      className={`rounded-md py-1.5 text-xs font-semibold transition ${
-                        practiceType === opt.id
-                          ? opt.id === 'PUT'
-                            ? 'bg-[#FF4D5A] text-white'
-                            : 'bg-[#00A88F] text-white'
-                          : 'border border-[#E5E9EF] bg-[#F5F7FA] text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
+            {!derivSession.connected ? (
+              <div className="mt-4 space-y-3 rounded-md bg-[#F5F7FA] p-4 dark:bg-[#0F151D]">
+                <p className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                  Connect your actual Deriv account to view your <strong>Demo (VRTC)</strong> &amp; <strong>Real (CR)</strong> balances, execute trades, and see real-time profit/loss calculate on every tick.
+                </p>
+                <button
+                  type="button"
+                  onClick={onOpenConnect}
+                  className="flex w-full items-center justify-center gap-2 rounded-md bg-[#0866FF] px-4 py-2.5 text-xs font-bold text-white hover:bg-[#0654d4]"
+                >
+                  <Wallet className="h-4 w-4" />
+                  Connect Deriv Demo &amp; Real Account
+                </button>
               </div>
-
-              <div className="flex items-center justify-between gap-3">
+            ) : (
+              <div className="mt-3 space-y-3">
                 <div>
-                  <div className="mb-1 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                    2. Virtual Stake
+                  <div className="mb-1.5 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                    1. Contract Type
                   </div>
-                  <div className="flex gap-1.5">
-                    {STAKE_PRESETS.map((amt) => (
+                  <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-5">
+                    {(
+                      [
+                        { id: 'CALL', label: 'Rise' },
+                        { id: 'PUT', label: 'Fall' },
+                        { id: 'DIGITEVEN', label: 'Even' },
+                        { id: 'DIGITODD', label: 'Odd' },
+                        { id: 'DIGITDIFF', label: `Diff ${tradeDigit}` },
+                      ] as const
+                    ).map((opt) => (
                       <button
-                        key={amt}
+                        key={opt.id}
                         type="button"
-                        onClick={() => setPracticeStake(amt)}
-                        className={`rounded-md px-3 py-1.5 font-mono text-xs font-semibold tabular-nums ${
-                          practiceStake === amt
-                            ? 'bg-[#101820] text-white dark:bg-[#0866FF]'
+                        onClick={() => setTradeType(opt.id)}
+                        className={`rounded-md py-1.5 text-xs font-semibold transition ${
+                          tradeType === opt.id
+                            ? opt.id === 'PUT'
+                              ? 'bg-[#FF4D5A] text-white'
+                              : 'bg-[#00A88F] text-white'
                             : 'border border-[#E5E9EF] bg-[#F5F7FA] text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
                         }`}
                       >
-                        ${amt}
+                        {opt.label}
                       </button>
                     ))}
                   </div>
                 </div>
 
-                <div className="pt-4">
-                  <button
-                    type="button"
-                    disabled={practiceBusy}
-                    onClick={handlePracticeTrade}
-                    className="inline-flex items-center gap-1.5 rounded-md bg-[#00A88F] px-4 py-2 text-xs font-bold text-white hover:bg-[#00917b] disabled:opacity-50"
-                  >
-                    <Play className="h-3.5 w-3.5" />
-                    {practiceBusy ? 'Placing…' : 'Place Practice Trade'}
-                  </button>
-                </div>
-              </div>
-
-              {practiceMsg && (
-                <div className="rounded-md bg-[#F5F7FA] px-3 py-2 text-xs text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]">
-                  {practiceMsg}
-                </div>
-              )}
-
-              {positions.length > 0 && (
-                <div className="space-y-1.5 border-t border-[#E5E9EF] pt-2.5 dark:border-[#243040]">
-                  <div className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                    Recent Practice Trades
-                  </div>
-                  {positions.map((pos) => (
-                    <div
-                      key={pos.position_id}
-                      className="flex items-center justify-between rounded bg-[#F5F7FA] px-2.5 py-1.5 text-xs dark:bg-[#0F151D]"
-                    >
-                      <span className="font-medium text-[#20242B] dark:text-[#F3F4F6]">
-                        {pos.contract_type} {pos.barrier ? `(${pos.barrier})` : ''} · ${pos.stake}
-                      </span>
-                      {pos.status === 'OPEN' ? (
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <div className="mb-1 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                      2. Stake ({derivSession.activeCurrency})
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {STAKE_PRESETS.map((amt) => (
                         <button
+                          key={amt}
                           type="button"
-                          onClick={() => void handleSettle(pos.position_id)}
-                          className="rounded bg-[#0866FF] px-2 py-0.5 text-[11px] font-semibold text-white hover:bg-[#0654d4]"
-                        >
-                          Settle
-                        </button>
-                      ) : (
-                        <span
-                          className={`font-mono font-bold tabular-nums ${
-                            (pos.profit_loss ?? 0) >= 0 ? 'text-[#00A88F]' : 'text-[#FF4D5A]'
+                          onClick={() => setTradeStake(amt)}
+                          className={`rounded px-2.5 py-1 font-mono text-xs font-semibold tabular-nums ${
+                            tradeStake === amt
+                              ? 'bg-[#101820] text-white dark:bg-[#0866FF]'
+                              : 'border border-[#E5E9EF] bg-[#F5F7FA] text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
                           }`}
                         >
-                          {pos.status} {(pos.profit_loss ?? 0) >= 0 ? '+' : ''}
-                          {(pos.profit_loss ?? 0).toFixed(2)}
-                        </span>
+                          ${amt}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="mb-1 text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                      3. Duration
+                    </div>
+                    <div className="flex gap-1.5">
+                      <input
+                        type="number"
+                        min={1}
+                        max={isDigitSelected ? 10 : 300}
+                        value={isDigitSelected ? Math.min(10, tradeDuration) : tradeDuration}
+                        onChange={(e) => setTradeDuration(Math.max(1, Number(e.target.value)))}
+                        className="w-16 rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 font-mono text-xs tabular-nums text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                      />
+                      {!isDigitSelected ? (
+                        <select
+                          value={tradeUnit}
+                          onChange={(e) => setTradeUnit(e.target.value as 't' | 's')}
+                          className="flex-1 rounded border border-[#E5E9EF] bg-[#F5F7FA] px-2 py-1 text-xs text-[#20242B] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+                        >
+                          <option value="t">Ticks</option>
+                          <option value="s">Seconds</option>
+                        </select>
+                      ) : (
+                        <span className="self-center text-xs text-[#6B7280]">Ticks</span>
                       )}
                     </div>
-                  ))}
+                  </div>
                 </div>
-              )}
-            </div>
+
+                {/* Live Deriv Payout Quote Preview */}
+                {liveProposal && (
+                  <div className="flex items-center justify-between rounded bg-[#F5F7FA] px-3 py-2 font-mono text-xs tabular-nums dark:bg-[#0F151D]">
+                    <span className="text-[#6B7280] dark:text-[#9CA3AF]">
+                      Payout: <strong className="text-[#20242B] dark:text-white">${liveProposal.payout.toFixed(2)}</strong>
+                    </span>
+                    <span className="text-[#6B7280] dark:text-[#9CA3AF]">
+                      Return:{' '}
+                      <strong className="text-[#00A88F]">
+                        +${(liveProposal.payout - liveProposal.askPrice).toFixed(2)} (
+                        {(((liveProposal.payout - liveProposal.askPrice) / liveProposal.askPrice) * 100).toFixed(1)}%)
+                      </strong>
+                    </span>
+                  </div>
+                )}
+
+                {!derivSession.activeIsVirtual && (
+                  <label className="flex items-center gap-2 rounded border border-[#FF444F]/40 bg-[#FF444F]/10 px-3 py-2 text-xs text-[#FF444F]">
+                    <input
+                      type="checkbox"
+                      checked={realTradeConfirm}
+                      onChange={(e) => setRealTradeConfirm(e.target.checked)}
+                      className="h-4 w-4 accent-[#FF444F]"
+                    />
+                    <span>Confirm live trade using REAL balance ({derivSession.activeLoginId})</span>
+                  </label>
+                )}
+
+                <button
+                  type="button"
+                  disabled={tradeBusy}
+                  onClick={handlePlaceDerivTrade}
+                  className={`flex w-full items-center justify-center gap-1.5 rounded-md px-4 py-2.5 text-xs font-bold text-white disabled:opacity-50 ${
+                    derivSession.activeIsVirtual
+                      ? 'bg-[#00A88F] hover:bg-[#00917b]'
+                      : 'bg-[#FF444F] hover:bg-[#e53843]'
+                  }`}
+                >
+                  <Play className="h-3.5 w-3.5" />
+                  {tradeBusy
+                    ? 'Sending Order to Deriv…'
+                    : `Place ${tradeType} on ${derivSession.activeIsVirtual ? 'Demo' : 'REAL'} ($${tradeStake})`}
+                </button>
+
+                {tradeMsg && (
+                  <div className="rounded-md bg-[#F5F7FA] px-3 py-2 text-xs text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]">
+                    {tradeMsg}
+                  </div>
+                )}
+
+                {/* Real-Time Open & Settled Contracts (proposal_open_contract live P&L) */}
+                {liveContracts.length > 0 && (
+                  <div className="space-y-1.5 border-t border-[#E5E9EF] pt-2.5 dark:border-[#243040]">
+                    <div className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                      Real-Time Contract Calculations (Updates Every Tick)
+                    </div>
+                    {liveContracts.slice(0, 5).map((c) => (
+                      <div
+                        key={c.contractId}
+                        className="rounded bg-[#F5F7FA] px-3 py-2 text-xs dark:bg-[#0F151D]"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-[#20242B] dark:text-[#F3F4F6]">
+                            {c.contractType} · {c.symbol} · ${c.buyPrice.toFixed(2)}
+                          </span>
+                          <span
+                            className={`font-mono font-bold tabular-nums ${
+                              c.profit >= 0 ? 'text-[#00A88F]' : 'text-[#FF4D5A]'
+                            }`}
+                          >
+                            {c.profit >= 0 ? '+' : ''}
+                            {c.profit.toFixed(2)} {c.currency} ({c.profitPct >= 0 ? '+' : ''}
+                            {c.profitPct.toFixed(1)}%)
+                          </span>
+                        </div>
+                        <div className="mt-1 flex items-center justify-between text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+                          <span className="font-mono tabular-nums">
+                            Entry: {c.entrySpot ?? '—'} → Now: {c.currentSpot ?? '—'}
+                          </span>
+                          {c.status === 'open' && !c.isSold ? (
+                            <button
+                              type="button"
+                              onClick={() => void handleSellEarly(c.contractId)}
+                              className="rounded bg-[#0866FF] px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-[#0654d4]"
+                            >
+                              Sell (${c.bidPrice.toFixed(2)})
+                            </button>
+                          ) : (
+                            <span className="font-mono uppercase">{c.status}</span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>

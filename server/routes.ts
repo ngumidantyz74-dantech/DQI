@@ -1183,42 +1183,32 @@ export function registerApiRoutes(app: Express): void {
   // ---------------- DERIV OAUTH & CONTROLLED LIVE EXECUTION ----------------
 
   app.get('/api/v1/auth/deriv/status', (_req: Request, res: Response) => {
+    const appId = serverConfig.derivClientId || serverConfig.derivAppId || '1089';
+    const customAppConfigured = Boolean(serverConfig.derivClientId || process.env.DERIV_APP_ID);
     res.json({
-      configured: isDerivOAuthConfigured(),
+      configured: true,
+      customAppConfigured,
       connected: false,
+      appId,
       redirectUriConfigured: Boolean(serverConfig.derivRedirectUri),
-      clientIdConfigured: Boolean(serverConfig.derivClientId),
+      clientIdConfigured: Boolean(serverConfig.derivClientId || process.env.DERIV_APP_ID),
       scopes: serverConfig.derivOAuthScopes,
-      message: isDerivOAuthConfigured()
-        ? 'Deriv OAuth 2.0 PKCE configured on server.'
-        : 'Set DERIV_CLIENT_ID and DERIV_REDIRECT_URI in server environment to enable server-side Deriv OAuth.',
+      message: customAppConfigured
+        ? `Ready for Deriv OAuth (App ID ${appId}) or direct API Token login.`
+        : 'Ready with default App ID 1089 (use your own Deriv App ID for OAuth redirect or connect directly with a Deriv API Token).',
     });
   });
 
   app.get('/api/v1/auth/deriv/start', (_req: Request, res: Response) => {
-    if (!isDerivOAuthConfigured()) {
-      res.status(503).json({
-        error: 'DERIV_OAUTH_NOT_CONFIGURED',
-        message: 'DERIV_CLIENT_ID and DERIV_REDIRECT_URI must be configured in server environment variables.',
-      });
-      return;
-    }
-    const verifier = randomToken(48);
-    const state = randomToken(32);
-    previewStore.oauthTransactions.set(sha256(state), {
-      verifier: encryptSecret(verifier),
-      redirectUri: serverConfig.derivRedirectUri,
-      expiresAt: Date.now() + 10 * 60 * 1000,
-    });
-    const url = new URL('/oauth2/auth', serverConfig.derivAuthBaseUrl);
-    url.searchParams.set('response_type', 'code');
-    url.searchParams.set('client_id', serverConfig.derivClientId);
-    url.searchParams.set('redirect_uri', serverConfig.derivRedirectUri);
-    url.searchParams.set('scope', serverConfig.derivOAuthScopes);
-    url.searchParams.set('state', state);
-    url.searchParams.set('code_challenge', pkceChallenge(verifier));
-    url.searchParams.set('code_challenge_method', 'S256');
-    res.json({ authorizationUrl: url.toString() });
+    const appId = serverConfig.derivClientId || serverConfig.derivAppId || '1089';
+    const authBase = serverConfig.derivAuthBaseUrl.includes('auth.deriv.com')
+      ? 'https://oauth.deriv.com'
+      : serverConfig.derivAuthBaseUrl;
+    const url = new URL('/oauth2/authorize', authBase);
+    url.searchParams.set('app_id', appId);
+    url.searchParams.set('l', 'EN');
+    url.searchParams.set('brand', 'deriv');
+    res.json({ authorizationUrl: url.toString(), appId });
   });
 
   app.get('/api/v1/auth/deriv/callback', async (req: Request, res: Response) => {
@@ -1305,6 +1295,18 @@ export function registerApiRoutes(app: Express): void {
       acknowledged_at: null,
       created_at: new Date().toISOString(),
     });
+    res.json({
+      liveGate: previewStore.liveGate,
+      automationControl: previewStore.automationControl,
+    });
+  });
+
+  app.post('/api/v1/live/reset-kill-switch', (_req: Request, res: Response) => {
+    previewStore.liveGate.kill_switch = false;
+    previewStore.liveGate.updated_at = new Date().toISOString();
+    previewStore.automationControl.kill_switch = false;
+    previewStore.automationControl.paused_reason = null;
+    previewStore.automationControl.updated_at = new Date().toISOString();
     res.json({
       liveGate: previewStore.liveGate,
       automationControl: previewStore.automationControl,
