@@ -1,13 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
   AlertTriangle,
+  BarChart2,
   CheckCircle2,
+  Crown,
+  Layers,
   Lock,
   Pause,
   Play,
-  Radar,
+  RefreshCw,
   RotateCcw,
   ShieldCheck,
+  SlidersHorizontal,
+  Timer,
+  TrendingUp,
   Wallet,
 } from 'lucide-react';
 import { dqiApi } from '../services/dqiApi';
@@ -62,27 +69,27 @@ interface BotTradeRecord {
   timestamp: string;
 }
 
-const CORE_MARKETS: Array<{ code: string; label: string }> = [
-  { code: '1HZ10V', label: 'Volatility 10 (1s)' },
-  { code: '1HZ15V', label: 'Volatility 15 (1s)' },
-  { code: '1HZ25V', label: 'Volatility 25 (1s)' },
-  { code: '1HZ50V', label: 'Volatility 50 (1s)' },
-  { code: '1HZ75V', label: 'Volatility 75 (1s)' },
-  { code: '1HZ100V', label: 'Volatility 100 (1s)' },
-  { code: 'R_10', label: 'Volatility 10' },
-  { code: 'R_25', label: 'Volatility 25' },
-  { code: 'R_50', label: 'Volatility 50' },
-  { code: 'R_75', label: 'Volatility 75' },
-  { code: 'R_100', label: 'Volatility 100' },
+const CORE_MARKETS: Array<{ code: string; label: string; shortLabel: string }> = [
+  { code: '1HZ10V', label: 'Volatility 10 (1s)', shortLabel: 'V10 1s' },
+  { code: '1HZ15V', label: 'Volatility 15 (1s)', shortLabel: 'V15 1s' },
+  { code: '1HZ25V', label: 'Volatility 25 (1s)', shortLabel: 'V25 1s' },
+  { code: '1HZ50V', label: 'Volatility 50 (1s)', shortLabel: 'V50 1s' },
+  { code: '1HZ75V', label: 'Volatility 75 (1s)', shortLabel: 'V75 1s' },
+  { code: '1HZ100V', label: 'Volatility 100 (1s)', shortLabel: 'V100 1s' },
+  { code: 'R_10', label: 'Volatility 10', shortLabel: 'V10' },
+  { code: 'R_25', label: 'Volatility 25', shortLabel: 'V25' },
+  { code: 'R_50', label: 'Volatility 50', shortLabel: 'V50' },
+  { code: 'R_75', label: 'Volatility 75', shortLabel: 'V75' },
+  { code: 'R_100', label: 'Volatility 100', shortLabel: 'V100' },
 ];
 
-const SCAN_PHASES = [
-  'Streaming live Deriv ticks',
-  'Measuring digit frequencies & entropy',
-  'Checking tick cadence & volatility',
-  'Scanning digit gaps & transition pairs',
-  'Scoring best Match / Differ setup',
-];
+const ENGINE_STEPS = [
+  { id: 0, label: 'Data', icon: BarChart2 },
+  { id: 1, label: 'Pattern', icon: Activity },
+  { id: 2, label: 'Transitions', icon: Layers },
+  { id: 3, label: 'Gaps', icon: Timer },
+  { id: 4, label: 'Final', icon: TrendingUp },
+] as const;
 
 const MIN_STAKE_PRESETS = [0.35, 0.5, 1.0];
 const BOT_SETTINGS_KEY = 'dqi_match_differ_bot_v2';
@@ -161,7 +168,11 @@ function scoreCandidatesFromDigits(
         lastSeenTicksAgo: row.lastSeenTicksAgo,
         payout: proposals.match?.payout ?? null,
         askPrice: proposals.match?.askPrice ?? null,
-        reason: `Digit ${row.digit} hit ${row.percentage.toFixed(1)}% in sample · ${transPct > 12 ? `Markov lift ${transPct.toFixed(0)}% after ${latestDigit}` : `last seen ${gap} ticks ago`}`,
+        reason: `Digit ${row.digit} hit ${row.percentage.toFixed(1)}% in sample · ${
+          transPct > 12
+            ? `Markov lift ${transPct.toFixed(0)}% after ${latestDigit}`
+            : `last seen ${gap} ticks ago`
+        }`,
       });
     }
   }
@@ -180,7 +191,6 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   liveContracts,
   onOpenConnect,
 }) => {
-  // Persisted user preferences (selected markets to scan, strategy, stake rules)
   const savedCfg = useMemo(() => {
     try {
       const raw = window.localStorage.getItem(BOT_SETTINGS_KEY);
@@ -214,8 +224,8 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   const [maxStakeCap, setMaxStakeCap] = useState<number>(() =>
     typeof savedCfg.maxStakeCap === 'number' && savedCfg.maxStakeCap >= 0.35 ? savedCfg.maxStakeCap : 2.0
   );
-  const [maxDrawdown] = useState<number>(10.0); // Hard $10 max drawdown protection
-  const [minScoreThreshold, setMinScoreThreshold] = useState<number>(() =>
+  const [maxDrawdown] = useState<number>(10.0);
+  const [minScoreThreshold] = useState<number>(() =>
     typeof savedCfg.minScoreThreshold === 'number' ? savedCfg.minScoreThreshold : 74
   );
 
@@ -239,11 +249,13 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
 
   // Live digit feed state for the currently focused symbol
   const [digitsData, setDigitsData] = useState<DigitsFullResponse | null>(null);
+  const [syncingData, setSyncingData] = useState(false);
   const [dataError, setDataError] = useState<string | null>(null);
 
   // 5-phase scanner state
   const [scanning, setScanning] = useState(false);
-  const [scanPhaseIdx, setScanPhaseIdx] = useState(0);
+  const [scanPhaseIdx, setScanPhaseIdx] = useState<number>(4);
+  const [lastAnalysisTime, setLastAnalysisTime] = useState<string | null>(null);
   const [rankedSignals, setRankedSignals] = useState<RankedSignal[]>([]);
   const [lockedSignal, setLockedSignal] = useState<RankedSignal | null>(null);
   const [askPromptSignal, setAskPromptSignal] = useState<RankedSignal | null>(null);
@@ -280,7 +292,6 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     );
   }, [derivSession.connected, derivSession.activeLoginId, derivSession.activeBalance, sessionAccountId, minStake]);
 
-  // Keep currentStake aligned with minStake when streak is < 2
   useEffect(() => {
     if (consecutiveWins < 2) {
       setCurrentStake(minStake);
@@ -310,14 +321,12 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   const drawdownRemaining = Math.max(0, Number((maxDrawdown - drawdownUsed).toFixed(2)));
   const drawdownLocked = drawdownUsed >= maxDrawdown || drawdownRemaining < 0.35;
 
-  // Clamp effective next stake so a loss NEVER exceeds $10 drawdown cap
   const effectiveNextStake = useMemo(() => {
     if (drawdownLocked) return 0;
     const capped = Math.min(currentStake, maxStakeCap, drawdownRemaining);
     return Math.max(0.35, Number(capped.toFixed(2)));
   }, [currentStake, maxStakeCap, drawdownRemaining, drawdownLocked]);
 
-  // Live proposal for the currently locked signal
   const [liveProposal, setLiveProposal] = useState<{ askPrice: number; payout: number } | null>(null);
 
   const activeContractType: 'DIGITMATCH' | 'DIGITDIFF' =
@@ -347,7 +356,31 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     };
   }, [lockedSignal?.symbol, selectedSymbol, activeContractType, activeDigit, effectiveNextStake, minStake, drawdownLocked]);
 
-  // Real-time 0–9 digit calculation on the currently viewed symbol
+  // Sync live 100-tick history for selected symbol
+  const syncSelectedSymbolData = useCallback(async () => {
+    setSyncingData(true);
+    setDataError(null);
+    try {
+      const res = await dqiApi.analyzeDigits(selectedSymbol, 100, minStake, 1);
+      setDigitsData(res);
+      const ranked = scoreCandidatesFromDigits(
+        selectedSymbol,
+        marketNameFor(selectedSymbol, symbols),
+        res,
+        strategyFilter
+      );
+      if (ranked.length > 0) {
+        setRankedSignals(ranked);
+        setLockedSignal(ranked[0]);
+        setLastAnalysisTime(new Date().toLocaleTimeString());
+      }
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Waiting for Deriv live quotes...');
+    } finally {
+      setSyncingData(false);
+    }
+  }, [selectedSymbol, minStake, symbols, strategyFilter]);
+
   useEffect(() => {
     let cancelled = false;
     void dqiApi
@@ -356,17 +389,16 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         if (!cancelled) {
           setDigitsData(res);
           setDataError(null);
-          if (!lockedSignal || lockedSignal.symbol !== selectedSymbol) {
-            const ranked = scoreCandidatesFromDigits(
-              selectedSymbol,
-              marketNameFor(selectedSymbol, symbols),
-              res,
-              strategyFilter
-            );
-            if (ranked.length > 0) {
-              setRankedSignals(ranked);
-              setLockedSignal(ranked[0]);
-            }
+          const ranked = scoreCandidatesFromDigits(
+            selectedSymbol,
+            marketNameFor(selectedSymbol, symbols),
+            res,
+            strategyFilter
+          );
+          if (ranked.length > 0) {
+            setRankedSignals(ranked);
+            setLockedSignal((prev) => (!prev || prev.symbol !== selectedSymbol ? ranked[0] : prev));
+            setLastAnalysisTime((prev) => prev || new Date().toLocaleTimeString());
           }
         }
       })
@@ -415,7 +447,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     };
   }, [digitsData, liveTapeBuffer]);
 
-  // Watch liveContracts for settlement of bot trades -> update 2-win stake booster / min-loss reset
+  // Watch liveContracts for settlement -> 2-win stake booster / min-loss reset
   useEffect(() => {
     if (liveContracts.length === 0) return;
 
@@ -442,7 +474,6 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       if (live.profit > 0) {
         setConsecutiveWins((prevStreak) => {
           const nextStreak = prevStreak + 1;
-          // Win twice consecutively -> add stake!
           if (nextStreak >= 2 && nextStreak % 2 === 0) {
             setCurrentStake((prevStake) => {
               const boosted = Math.min(maxStakeCap, Number((prevStake + winStepAdd).toFixed(2)));
@@ -459,17 +490,16 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
           return nextStreak;
         });
       } else {
-        // Any loss -> immediate reset to minimum stake to avoid $10 drawdown
         setConsecutiveWins(0);
         setCurrentStake(minStake);
         setStatusMessage(
-          `Loss ($${live.profit.toFixed(2)}). Stake reset immediately to minimum $${minStake.toFixed(2)} to protect your $10 drawdown cap.`
+          `Loss ($${live.profit.toFixed(2)}). Stake reset immediately to minimum $${minStake.toFixed(2)} to avoid $10 drawdown.`
         );
       }
     }
   }, [liveContracts, sessionTrades, maxStakeCap, winStepAdd, minStake]);
 
-  // Execute a 5-phase scan ONLY across user's chosen markets (scanMarkets)
+  // Execute 5-step Deep Analysis ONLY across user's selected scanMarkets
   const runTargetedScan = useCallback(async (): Promise<RankedSignal | null> => {
     const targets = scanMarkets.length > 0 ? scanMarkets : [selectedSymbol];
     setScanning(true);
@@ -481,8 +511,12 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
 
       for (let idx = 0; idx < targets.length; idx += 1) {
         const sym = targets[idx];
-        setScanPhaseIdx(Math.min(2, idx));
+        setScanPhaseIdx(0);
         const res = await dqiApi.analyzeDigits(sym, 100, effectiveNextStake || minStake, 1);
+        setScanPhaseIdx(1);
+        await new Promise((r) => window.setTimeout(r, 90));
+        setScanPhaseIdx(2);
+        await new Promise((r) => window.setTimeout(r, 90));
         setScanPhaseIdx(3);
         const candidates = scoreCandidatesFromDigits(
           sym,
@@ -505,6 +539,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       const best = allRanked[0] ?? null;
       if (best) {
         setLockedSignal(best);
+        setLastAnalysisTime(new Date().toLocaleTimeString());
         if (best.symbol !== selectedSymbol) {
           onSelectSymbol(best.symbol);
         }
@@ -591,7 +626,6 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
     ]
   );
 
-  // Auto-Scan Loop for 'ASK' (Ask Me) and 'AUTO' (Auto Bot) modes
   const hasOpenBotTrade = useMemo(() => sessionTrades.some((t) => t.status === 'open'), [sessionTrades]);
 
   useEffect(() => {
@@ -600,7 +634,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       setAutoRunning(false);
       return;
     }
-    if (botMode === 'ASK' && askPromptSignal) return; // Wait for user decision
+    if (botMode === 'ASK' && askPromptSignal) return;
     if (tradeBusy || hasOpenBotTrade || scanning) return;
 
     const timer = window.setTimeout(() => {
@@ -609,7 +643,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
         if (!best) return;
         if (best.score < minScoreThreshold) {
           setStatusMessage(
-            `Scanned ${scanMarkets.join(', ')}: best score ${best.score} < ${minScoreThreshold} threshold. Waiting…`
+            `Scanned ${scanMarkets.join(', ')}: confidence ${best.score}% < ${minScoreThreshold}% threshold. Waiting…`
           );
           return;
         }
@@ -639,7 +673,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
   const toggleMarketInWatchlist = (code: string) => {
     setScanMarkets((prev) => {
       if (prev.includes(code)) {
-        if (prev.length === 1) return prev; // Keep at least 1 chosen market
+        if (prev.length === 1) return prev;
         const next = prev.filter((m) => m !== code);
         if (selectedSymbol === code) onSelectSymbol(next[0]);
         return next;
@@ -673,277 +707,252 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
       ? Number((liveProposal.payout - liveProposal.askPrice).toFixed(2))
       : null;
 
+  const confidencePct = lockedSignal?.score ?? 0;
+
   return (
     <div className="space-y-4">
-      {/* Top 4-Control Bar: User-Chosen Markets · Strategy · Bot Mode · Scan */}
-      <div className="rounded-lg border border-[#E5E9EF] bg-white p-4 dark:border-[#243040] dark:bg-[#151D27]">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          {/* Control 1: Market Selector (User chooses exact market to scan) */}
-          <div className="flex flex-wrap items-center gap-2">
-            <select
-              aria-label="Select primary market to scan"
-              value={selectedSymbol}
-              onChange={(e) => {
-                const code = e.target.value;
-                onSelectSymbol(code);
-                if (!scanMarkets.includes(code)) {
-                  setScanMarkets([code]);
-                }
-              }}
-              className="rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-2 text-xs font-semibold text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
-            >
-              {CORE_MARKETS.map((m) => (
-                <option key={m.code} value={m.code}>
-                  {m.label} ({m.code})
-                </option>
-              ))}
-              {symbols
-                .filter((s) => !CORE_MARKETS.some((m) => m.code === s.symbol))
-                .map((s) => (
-                  <option key={s.symbol} value={s.symbol}>
-                    {s.display_name} ({s.symbol})
-                  </option>
-                ))}
-            </select>
-
-            {/* Control 2: Match / Differ Strategy Filter */}
-            <div className="flex items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
-              {(
-                [
-                  { id: 'BEST', label: 'Best (M+D)' },
-                  { id: 'DIGITMATCH', label: 'Matches' },
-                  { id: 'DIGITDIFF', label: 'Differs' },
-                ] as const
-              ).map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => setStrategyFilter(opt.id)}
-                  className={`whitespace-nowrap rounded px-2.5 py-1.5 text-xs font-semibold transition ${
-                    strategyFilter === opt.id
-                      ? 'bg-[#0866FF] text-white'
-                      : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Control 3 & 4: Mode Selector + Primary Scan/Bot Button */}
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
-              {(
-                [
-                  { id: 'MANUAL', label: 'Manual' },
-                  { id: 'ASK', label: 'Ask Me' },
-                  { id: 'AUTO', label: 'Auto Bot' },
-                ] as const
-              ).map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  onClick={() => {
-                    setBotMode(m.id);
-                    if (m.id === 'MANUAL') {
-                      setAutoRunning(false);
-                      setAskPromptSignal(null);
-                    }
-                  }}
-                  className={`whitespace-nowrap rounded px-2.5 py-1.5 text-xs font-semibold transition ${
-                    botMode === m.id
-                      ? 'bg-[#101820] text-white dark:bg-[#0866FF]'
-                      : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
-                  }`}
-                >
-                  {m.label}
-                </button>
-              ))}
-            </div>
-
-            {botMode === 'MANUAL' ? (
-              <button
-                type="button"
-                disabled={scanning}
-                onClick={() => void runTargetedScan()}
-                className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md bg-[#0866FF] px-4 py-2 text-xs font-bold text-white hover:bg-[#0654d4] disabled:opacity-50"
-              >
-                <Radar className={`h-3.5 w-3.5 ${scanning ? 'animate-spin' : ''}`} />
-                {scanning ? 'Scanning…' : 'Scan Selected Market'}
-              </button>
-            ) : (
-              <button
-                type="button"
-                disabled={drawdownLocked}
-                onClick={() => {
-                  if (autoRunning) {
-                    setAutoRunning(false);
-                  } else {
-                    setAutoRunning(true);
-                    void runTargetedScan();
-                  }
-                }}
-                className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-4 py-2 text-xs font-bold text-white disabled:opacity-50 ${
-                  autoRunning
-                    ? 'bg-[#FF444F] hover:bg-[#e53843]'
-                    : 'bg-[#00A88F] hover:bg-[#00917b]'
-                }`}
-              >
-                {autoRunning ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-                {autoRunning ? 'Stop Scanner' : botMode === 'ASK' ? 'Start Ask-Me Scan' : 'Start Auto Bot'}
-              </button>
-            )}
-          </div>
-        </div>
-
-        {/* Focused Custom Market Watchlist (Scan ONLY what you pick — never random markets) */}
-        <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-[#E5E9EF] pt-3 text-xs dark:border-[#243040]">
-          <span className="mr-1 text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-            Bot Scan List:
-          </span>
-          {CORE_MARKETS.slice(0, 6).map((m) => {
-            const included = scanMarkets.includes(m.code);
-            return (
-              <button
-                key={m.code}
-                type="button"
-                onClick={() => toggleMarketInWatchlist(m.code)}
-                className={`whitespace-nowrap rounded px-2 py-1 text-[11px] font-semibold transition ${
-                  included
-                    ? 'bg-[#0866FF]/12 text-[#0866FF] ring-1 ring-[#0866FF]/40'
-                    : 'bg-[#F5F7FA] text-[#6B7280] hover:text-[#20242B] dark:bg-[#0F151D] dark:text-[#9CA3AF]'
-                }`}
-              >
-                {m.label}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
       {dataError && (
         <div className="rounded-lg border border-[#FF444F]/40 bg-[#FF444F]/10 px-4 py-2.5 text-xs text-[#FF444F]">
           {dataError}
         </div>
       )}
 
-      {/* Main 2-Column Workspace */}
-      <div className="grid grid-cols-1 items-stretch gap-4 lg:grid-cols-12">
-        {/* LEFT (7 cols): Live Signal Analyzer & 0-9 Digit Matrix */}
-        <div className="flex flex-col justify-between space-y-4 rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27] lg:col-span-7">
-          <div>
-            {/* Latest Tick Header */}
-            <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#E5E9EF] pb-4 dark:border-[#243040]">
-              <div>
-                <div className="text-xs font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                  {marketNameFor(selectedSymbol, symbols)} · {liveDigits.total} live ticks
-                </div>
-                <div className="mt-1 font-mono text-3xl font-bold tabular-nums text-[#20242B] dark:text-white">
-                  {displayQuote ? (
-                    <>
-                      <span>{quotePrefix}</span>
-                      <span className="ml-0.5 rounded bg-[#0866FF] px-1.5 py-0.5 text-white">
-                        {quoteLastChar}
-                      </span>
-                    </>
-                  ) : (
-                    'Connecting…'
-                  )}
-                </div>
+      {/* Main Layout: Left Mirrors the Clean Vertical Analysis Screenshot Flow; Right Holds Bot & Account Progress */}
+      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-12">
+        {/* LEFT COLUMN (7 cols): Market Selector -> 5-Step Analysis Engine -> Centered Prediction Hero -> Market Stats */}
+        <div className="space-y-4 lg:col-span-7">
+          {/* 1. MARKET SELECTOR CARD */}
+          <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <SlidersHorizontal className="h-4 w-4 text-[#0866FF]" />
+                <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
+                  Market Selector
+                </h2>
               </div>
 
-              <div className="flex items-center gap-5 text-right font-mono text-xs tabular-nums">
-                <div>
-                  <div className="text-[11px] font-sans text-[#6B7280] dark:text-[#9CA3AF]">Entropy</div>
-                  <div className="font-bold text-[#20242B] dark:text-white">
-                    {digitsData ? `${digitsData.analytics.entropyBits.toFixed(2)} b` : '—'}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-[11px] font-sans text-[#6B7280] dark:text-[#9CA3AF]">Speed</div>
-                  <div className="font-bold text-[#20242B] dark:text-white">
-                    {digitsData?.volatility.regime || 'LIVE'}
-                  </div>
-                </div>
+              {/* Strategy Segmented Toggle */}
+              <div className="flex items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
+                {(
+                  [
+                    { id: 'BEST', label: 'Best (M+D)' },
+                    { id: 'DIGITMATCH', label: 'Matches' },
+                    { id: 'DIGITDIFF', label: 'Differs' },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setStrategyFilter(opt.id)}
+                    className={`whitespace-nowrap rounded px-2.5 py-1 text-xs font-semibold transition ${
+                      strategyFilter === opt.id
+                        ? 'bg-[#0866FF] text-white'
+                        : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
               </div>
             </div>
 
-            {/* Locked Signal Ready Panel */}
-            <div className="mt-4 rounded-lg border border-[#E5E9EF] bg-[#F5F7FA] p-4 dark:border-[#243040] dark:bg-[#0F151D]">
-              {scanning ? (
-                <div className="flex items-center justify-between gap-4 py-2">
-                  <div>
-                    <div className="text-xs font-bold text-[#0866FF]">
-                      Phase {scanPhaseIdx + 1}/5 · {SCAN_PHASES[scanPhaseIdx]}
-                    </div>
-                    <div className="mt-1 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                      Scanning only your selected market(s): {scanMarkets.join(', ')}
-                    </div>
+            {/* Primary Market Dropdown */}
+            <div className="mt-3">
+              <select
+                aria-label="Select primary market to scan"
+                value={selectedSymbol}
+                onChange={(e) => {
+                  const code = e.target.value;
+                  onSelectSymbol(code);
+                  if (!scanMarkets.includes(code)) {
+                    setScanMarkets([code]);
+                  }
+                }}
+                className="w-full rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-3 py-2.5 text-sm font-semibold text-[#20242B] outline-none focus:border-[#0866FF] dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+              >
+                {CORE_MARKETS.map((m) => (
+                  <option key={m.code} value={m.code}>
+                    {m.shortLabel} — {m.label} ({m.code})
+                  </option>
+                ))}
+                {symbols
+                  .filter((s) => !CORE_MARKETS.some((m) => m.code === s.symbol))
+                  .map((s) => (
+                    <option key={s.symbol} value={s.symbol}>
+                      {s.display_name} ({s.symbol})
+                    </option>
+                  ))}
+              </select>
+            </div>
+
+            {/* 2 Clean Action Buttons matching Screenshot (Sync Data + Run Deep Analysis) */}
+            <div className="mt-3 flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                disabled={syncingData || scanning}
+                onClick={() => void syncSelectedSymbolData()}
+                className="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md border border-[#E5E9EF] bg-[#F5F7FA] px-4 py-2 text-xs font-semibold text-[#20242B] hover:border-[#0866FF] disabled:opacity-50 dark:border-[#243040] dark:bg-[#0F151D] dark:text-white"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${syncingData ? 'animate-spin text-[#0866FF]' : ''}`} />
+                {syncingData ? 'Syncing…' : 'Sync Data'}
+              </button>
+
+              <button
+                type="button"
+                disabled={scanning}
+                onClick={() => void runTargetedScan()}
+                className="inline-flex flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-[#0866FF] px-5 py-2 text-xs font-bold text-white hover:bg-[#0654d4] disabled:opacity-50 sm:flex-none"
+              >
+                <TrendingUp className="h-3.5 w-3.5" />
+                {scanning ? 'Running Deep Analysis…' : 'Run Deep Analysis'}
+              </button>
+            </div>
+
+            {/* User-Chosen Bot Scan Watchlist (never scans random markets) */}
+            <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
+              <span className="mr-1 text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                Scan Watchlist:
+              </span>
+              {CORE_MARKETS.slice(0, 6).map((m) => {
+                const included = scanMarkets.includes(m.code);
+                return (
+                  <button
+                    key={m.code}
+                    type="button"
+                    onClick={() => toggleMarketInWatchlist(m.code)}
+                    className={`whitespace-nowrap rounded px-2 py-1 text-[11px] font-semibold transition ${
+                      included
+                        ? 'bg-[#0866FF] text-white'
+                        : 'bg-[#F5F7FA] text-[#6B7280] hover:text-[#20242B] dark:bg-[#0F151D] dark:text-[#9CA3AF] dark:hover:text-white'
+                    }`}
+                  >
+                    {m.shortLabel}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          {/* 2. 5-STEP ANALYSIS ENGINE STRIP (Mirrors screenshot's 5 horizontal engine blocks) */}
+          <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Activity className="h-4 w-4 text-[#0866FF]" />
+                <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
+                  DQI Analysis Engine
+                </h2>
+              </div>
+              <span className="font-mono text-xs font-semibold tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
+                {scanning ? `Phase ${scanPhaseIdx + 1}/5` : lockedSignal ? '5/5 Complete' : 'Ready'}
+              </span>
+            </div>
+
+            <div className="mt-3 grid grid-cols-5 gap-2">
+              {ENGINE_STEPS.map((step) => {
+                const Icon = step.icon;
+                const isDone = !scanning && Boolean(lockedSignal);
+                const isCurrent = scanning && scanPhaseIdx === step.id;
+                const isCompletedStep = scanning ? scanPhaseIdx > step.id : isDone;
+                return (
+                  <div
+                    key={step.id}
+                    className={`flex flex-col items-center justify-center rounded-md border px-2 py-2.5 text-center transition ${
+                      isCurrent
+                        ? 'border-[#0866FF] bg-[#0866FF] text-white'
+                        : isCompletedStep
+                        ? 'border-[#00A88F]/40 bg-[#00A88F]/10 text-[#00A88F]'
+                        : 'border-[#E5E9EF] bg-[#F5F7FA] text-[#6B7280] dark:border-[#243040] dark:bg-[#0F151D] dark:text-[#9CA3AF]'
+                    }`}
+                  >
+                    <Icon className="h-3.5 w-3.5" />
+                    <span className="mt-1 text-[11px] font-semibold leading-tight">
+                      {step.label}
+                    </span>
                   </div>
-                  <div className="font-mono text-lg font-bold tabular-nums text-[#0866FF]">
-                    {Math.round(((scanPhaseIdx + 1) / 5) * 100)}%
-                  </div>
+                );
+              })}
+            </div>
+
+            {/* Completion Summary Line matching screenshot */}
+            <div className="mt-3 flex items-center gap-2 text-xs font-medium text-[#20242B] dark:text-[#F3F4F6]">
+              <CheckCircle2
+                className={`h-4 w-4 shrink-0 ${
+                  scanning ? 'text-[#0866FF]' : lockedSignal ? 'text-[#00A88F]' : 'text-[#6B7280]'
+                }`}
+              />
+              <span>
+                {scanning
+                  ? `Scanning ${scanMarkets.join(', ')} — Step ${scanPhaseIdx + 1} of 5…`
+                  : lockedSignal
+                  ? `Analysis Complete! Prediction: ${
+                      lockedSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'
+                    } Digit ${lockedSignal.digit} with ${lockedSignal.score}% confidence`
+                  : 'Click Run Deep Analysis to evaluate your chosen market(s).'}
+              </span>
+            </div>
+          </section>
+
+          {/* 3. CENTERED PREDICTION HERO CARD (Mirrors PlusPro AI Prediction Card) */}
+          <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
+            <div className="rounded-lg border border-[#E5E9EF] bg-[#F5F7FA] px-5 py-6 text-center dark:border-[#243040] dark:bg-[#0F151D]">
+              <div className="flex justify-center">
+                <Crown
+                  className={`h-7 w-7 ${
+                    activeContractType === 'DIGITMATCH' ? 'text-[#00A88F]' : 'text-[#0866FF]'
+                  }`}
+                />
+              </div>
+
+              <div className="mt-2 text-sm font-bold text-[#20242B] dark:text-white">
+                DQI Signal Prediction ·{' '}
+                <span
+                  className={
+                    activeContractType === 'DIGITMATCH' ? 'text-[#00A88F]' : 'text-[#0866FF]'
+                  }
+                >
+                  {activeContractType === 'DIGITMATCH' ? 'Digit Matches' : 'Digit Differs'}
+                </span>
+              </div>
+
+              {/* Giant Centered Predicted Digit */}
+              <div className="mt-3 font-mono text-6xl font-bold leading-none tabular-nums text-[#20242B] dark:text-white">
+                {lockedSignal ? lockedSignal.digit : '—'}
+              </div>
+
+              {/* Confidence Progress Bar */}
+              <div className="mx-auto mt-4 max-w-sm">
+                <div className="h-2.5 overflow-hidden rounded-full bg-[#E5E9EF] dark:bg-[#243040]">
+                  <div
+                    className={`h-full transition-all duration-300 ${
+                      confidencePct >= 80
+                        ? 'bg-[#00A88F]'
+                        : confidencePct >= 65
+                        ? 'bg-[#0866FF]'
+                        : 'bg-[#FFAD3A]'
+                    }`}
+                    style={{ width: `${Math.min(100, Math.max(4, confidencePct))}%` }}
+                  />
                 </div>
-              ) : lockedSignal ? (
-                <div className="flex flex-wrap items-center justify-between gap-4">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 text-xs font-semibold text-[#6B7280] dark:text-[#9CA3AF]">
-                      <span>{lockedSignal.symbolLabel}</span>
-                      <span aria-hidden="true">·</span>
-                      <span>
-                        {lockedSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'}
-                      </span>
-                      <span aria-hidden="true">·</span>
-                      <span
-                        className={
-                          lockedSignal.strength === 'STRONG'
-                            ? 'text-[#00A88F]'
-                            : lockedSignal.strength === 'MODERATE'
-                            ? 'text-[#0866FF]'
-                            : 'text-[#FFAD3A]'
-                        }
-                      >
-                        {lockedSignal.strength}
-                      </span>
-                    </div>
+              </div>
 
-                    <div className="mt-1 flex items-baseline gap-2.5">
-                      <span className="text-lg font-bold text-[#20242B] dark:text-white">
-                        {lockedSignal.contractType === 'DIGITMATCH' ? 'Digit Matches' : 'Digit Differs'}{' '}
-                        <span className="font-mono text-[#0866FF]">DIGIT {lockedSignal.digit}</span>
-                      </span>
-                    </div>
+              <div className="mt-3 text-sm font-bold tabular-nums text-[#20242B] dark:text-white">
+                Confidence: {lockedSignal ? `${confidencePct}%` : '—'}
+              </div>
 
-                    <div className="mt-1 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                      {lockedSignal.reason}
-                    </div>
-                  </div>
+              <div className="mt-1 font-mono text-xs tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
+                Last Analysis: {lastAnalysisTime || 'Pending'}
+                {lockedSignal ? ` · ${lockedSignal.symbolLabel}` : ''}
+              </div>
 
-                  {/* Signal Score Dial */}
-                  <div className="flex shrink-0 items-center gap-3 rounded-lg border border-[#E5E9EF] bg-white px-4 py-2.5 dark:border-[#243040] dark:bg-[#151D27]">
-                    <div className="text-center">
-                      <div className="font-mono text-2xl font-bold tabular-nums text-[#0866FF]">
-                        {lockedSignal.score}
-                      </div>
-                      <div className="text-[10px] font-semibold uppercase tracking-wide text-[#6B7280] dark:text-[#9CA3AF]">
-                        Score
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="text-xs text-[#6B7280] dark:text-[#9CA3AF]">
-                  Click <strong>Scan Selected Market</strong> to analyze your chosen market and lock the best Match / Differ digit.
+              {lockedSignal && (
+                <div className="mt-2 text-xs text-[#6B7280] dark:text-[#9CA3AF]">
+                  {lockedSignal.reason}
                 </div>
               )}
 
-              {/* Top 3 Candidates Quick-Select Strip */}
+              {/* Quick Top-3 Signal Switcher when scan evaluated multiple picks */}
               {rankedSignals.length > 1 && !scanning && (
-                <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
-                  <span className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-                    Top Picks:
-                  </span>
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
                   {rankedSignals.slice(0, 3).map((cand) => {
                     const isPicked =
                       lockedSignal?.symbol === cand.symbol &&
@@ -963,7 +972,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                             : 'border border-[#E5E9EF] bg-white text-[#20242B] hover:border-[#0866FF] dark:border-[#243040] dark:bg-[#151D27] dark:text-[#F3F4F6]'
                         }`}
                       >
-                        {cand.contractType === 'DIGITMATCH' ? 'MATCH' : 'DIFF'} {cand.digit} ({cand.score})
+                        {cand.contractType === 'DIGITMATCH' ? 'MATCH' : 'DIFF'} {cand.digit} ({cand.score}%)
                       </button>
                     );
                   })}
@@ -971,18 +980,45 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               )}
             </div>
 
-            {/* 0–9 Interactive Frequency Strip */}
-            <div className="mt-4">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-[#20242B] dark:text-[#F3F4F6]">
-                  Live Digit Distribution (0–9) · Tap any digit to target
-                </span>
-                <span className="font-mono text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
-                  10.0% baseline
-                </span>
+            {/* Live Tick Feed + Clickable 0-9 Bars */}
+            <div className="mt-4 border-t border-[#E5E9EF] pt-4 dark:border-[#243040]">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
+                    {marketNameFor(selectedSymbol, symbols)} · Live Tick ({liveDigits.total} ticks)
+                  </div>
+                  <div className="mt-0.5 font-mono text-2xl font-bold tabular-nums text-[#20242B] dark:text-white">
+                    {displayQuote ? (
+                      <>
+                        <span>{quotePrefix}</span>
+                        <span className="ml-0.5 rounded bg-[#0866FF] px-1.5 py-0.5 text-white">
+                          {quoteLastChar}
+                        </span>
+                      </>
+                    ) : (
+                      'Connecting…'
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-4 text-right font-mono text-xs tabular-nums">
+                  <div>
+                    <div className="font-sans text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Entropy</div>
+                    <div className="font-bold text-[#20242B] dark:text-white">
+                      {digitsData ? `${digitsData.analytics.entropyBits.toFixed(2)} b` : '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-sans text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">Speed</div>
+                    <div className="font-bold text-[#20242B] dark:text-white">
+                      {digitsData?.volatility.regime || 'LIVE'}
+                    </div>
+                  </div>
+                </div>
               </div>
 
-              <div className="mt-2.5 grid grid-cols-10 gap-1.5">
+              {/* Interactive 0–9 Frequency Strip */}
+              <div className="mt-3 grid grid-cols-10 gap-1.5">
                 {liveDigits.bars.map((bar) => {
                   const isTarget = activeDigit === bar.digit;
                   const isLatest = displayDigit === bar.digit;
@@ -1006,10 +1042,10 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                           lastSeenTicksAgo: null,
                           payout: liveProposal?.payout ?? null,
                           askPrice: liveProposal?.askPrice ?? null,
-                          reason: `Manual digit ${bar.digit} selected (${bar.pct.toFixed(1)}% observed in last ${liveDigits.total} ticks)`,
+                          reason: `Manual digit ${bar.digit} selected (${bar.pct.toFixed(1)}% in last ${liveDigits.total} ticks)`,
                         });
                       }}
-                      className={`flex flex-col items-center rounded-md border p-1.5 transition ${
+                      className={`flex flex-col items-center rounded-md border p-1 transition ${
                         isTarget
                           ? 'border-[#0866FF] bg-[#0866FF]/10 ring-1 ring-[#0866FF]'
                           : isLatest
@@ -1020,9 +1056,9 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                       <span className="font-mono text-[10px] tabular-nums text-[#6B7280] dark:text-[#9CA3AF]">
                         {bar.pct.toFixed(0)}%
                       </span>
-                      <div className="my-1.5 flex h-14 w-full items-end justify-center">
+                      <div className="my-1 flex h-12 w-full items-end justify-center">
                         <div
-                          className={`w-3 rounded-t ${
+                          className={`w-2.5 rounded-t ${
                             isTarget
                               ? 'bg-[#0866FF]'
                               : isLatest
@@ -1039,44 +1075,50 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                   );
                 })}
               </div>
-            </div>
-          </div>
 
-          {/* Last 20 Digits Tape */}
-          <div className="border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
-            <div className="mb-1.5 text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
-              Latest 20 Digits
-            </div>
-            <div className="flex flex-wrap gap-1">
-              {liveDigits.tape20.length === 0 ? (
-                <span className="text-xs text-[#6B7280]">Waiting for incoming ticks…</span>
-              ) : (
-                liveDigits.tape20.map((t, idx) => {
-                  const isNewest = idx === liveDigits.tape20.length - 1;
-                  return (
-                    <span
-                      key={`${t.epoch}-${idx}`}
-                      className={`flex h-7 w-7 items-center justify-center rounded font-mono text-xs font-bold tabular-nums ${
-                        isNewest
-                          ? 'bg-[#0866FF] text-white'
-                          : t.digit === activeDigit
-                          ? 'bg-[#00A88F]/20 text-[#00A88F]'
-                          : 'bg-[#F5F7FA] text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
-                      }`}
-                    >
-                      {t.digit}
-                    </span>
-                  );
-                })
+              {/* Latest 20 Digits Tape */}
+              {liveDigits.tape20.length > 0 && (
+                <div className="mt-3 flex flex-wrap items-center gap-1">
+                  {liveDigits.tape20.map((t, idx) => {
+                    const isNewest = idx === liveDigits.tape20.length - 1;
+                    return (
+                      <span
+                        key={`${t.epoch}-${idx}`}
+                        className={`flex h-6 w-6 items-center justify-center rounded font-mono text-[11px] font-bold tabular-nums ${
+                          isNewest
+                            ? 'bg-[#0866FF] text-white'
+                            : t.digit === activeDigit
+                            ? 'bg-[#00A88F]/20 text-[#00A88F]'
+                            : 'bg-[#F5F7FA] text-[#20242B] dark:bg-[#0F151D] dark:text-[#F3F4F6]'
+                        }`}
+                      >
+                        {t.digit}
+                      </span>
+                    );
+                  })}
+                </div>
               )}
             </div>
-          </div>
+
+            {/* 4. CURRENT MARKET STATS FOOTER LINE (Mirrors bottom of screenshot) */}
+            <div className="mt-4 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-[#0866FF]">
+                <BarChart2 className="h-3.5 w-3.5" />
+                <span>Current Market Stats</span>
+              </div>
+              <div className="mt-1 font-mono text-xs tabular-nums text-[#20242B] dark:text-[#F3F4F6]">
+                Predicted Digit: <strong>{lockedSignal ? lockedSignal.digit : '—'}</strong> | Confidence:{' '}
+                <strong>{lockedSignal ? `${confidencePct}%` : '—'}</strong> | Latest Tick:{' '}
+                <strong>{displayDigit !== null ? displayDigit : '—'}</strong>
+              </div>
+            </div>
+          </section>
         </div>
 
-        {/* RIGHT (5 cols): Controlled Bot + 2-Win Stake Booster + $10 Drawdown Guard + Account Progress */}
-        <div className="flex flex-col justify-between space-y-4 lg:col-span-5">
-          {/* Account Progress & $10 Max Drawdown Guard */}
-          <div className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
+        {/* RIGHT COLUMN (5 cols): Account Progress + $10 Drawdown Guard + Controlled Match/Differ Bot */}
+        <div className="space-y-4 lg:col-span-5">
+          {/* Account Progress & $10.00 Drawdown Protection */}
+          <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between gap-2">
               <div>
                 <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
@@ -1153,10 +1195,10 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 </span>
               </div>
             </div>
-          </div>
+          </section>
 
-          {/* Controlled Bot Execution Card */}
-          <div className="flex-1 rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
+          {/* Controlled Match & Differ Bot */}
+          <section className="rounded-lg border border-[#E5E9EF] bg-white p-5 dark:border-[#243040] dark:bg-[#151D27]">
             <div className="flex items-center justify-between gap-2">
               <h2 className="text-sm font-bold text-[#20242B] dark:text-white">
                 Match &amp; Differ Bot
@@ -1166,7 +1208,62 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </span>
             </div>
 
-            {/* Strategy Rules Summary (3 clean inputs) */}
+            {/* Bot Execution Mode Switch (Manual / Ask Me / Auto Bot) */}
+            <div className="mt-3 flex items-center justify-between gap-2">
+              <div className="flex flex-1 items-center rounded-md border border-[#E5E9EF] bg-[#F5F7FA] p-0.5 dark:border-[#243040] dark:bg-[#0F151D]">
+                {(
+                  [
+                    { id: 'MANUAL', label: 'Manual' },
+                    { id: 'ASK', label: 'Ask Me' },
+                    { id: 'AUTO', label: 'Auto Bot' },
+                  ] as const
+                ).map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => {
+                      setBotMode(m.id);
+                      if (m.id === 'MANUAL') {
+                        setAutoRunning(false);
+                        setAskPromptSignal(null);
+                      }
+                    }}
+                    className={`flex-1 whitespace-nowrap rounded px-2.5 py-1.5 text-xs font-semibold transition ${
+                      botMode === m.id
+                        ? 'bg-[#101820] text-white dark:bg-[#0866FF]'
+                        : 'text-[#6B7280] hover:text-[#20242B] dark:text-[#9CA3AF] dark:hover:text-white'
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+
+              {botMode !== 'MANUAL' && (
+                <button
+                  type="button"
+                  disabled={drawdownLocked}
+                  onClick={() => {
+                    if (autoRunning) {
+                      setAutoRunning(false);
+                    } else {
+                      setAutoRunning(true);
+                      void runTargetedScan();
+                    }
+                  }}
+                  className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3.5 py-1.5 text-xs font-bold text-white disabled:opacity-50 ${
+                    autoRunning
+                      ? 'bg-[#FF444F] hover:bg-[#e53843]'
+                      : 'bg-[#00A88F] hover:bg-[#00917b]'
+                  }`}
+                >
+                  {autoRunning ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                  {autoRunning ? 'Stop' : 'Start'}
+                </button>
+              )}
+            </div>
+
+            {/* 3 Clean Stake & Protection Inputs */}
             <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
               <div>
                 <label className="block text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
@@ -1221,12 +1318,16 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </div>
             </div>
 
-            {/* Ask-Me Confirmation Banner when bot finds a strong signal */}
+            <div className="mt-2 text-[11px] text-[#6B7280] dark:text-[#9CA3AF]">
+              Win 2x consecutively → adds +${winStepAdd.toFixed(2)} · Loss → resets to ${minStake.toFixed(2)} min stake.
+            </div>
+
+            {/* Ask-Me Confirmation Banner */}
             {askPromptSignal && !drawdownLocked && (
               <div className="mt-3 rounded-md border border-[#0866FF] bg-[#0866FF]/10 p-3 text-xs">
                 <div className="font-bold text-[#20242B] dark:text-white">
-                  Signal Found: {askPromptSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit{' '}
-                  {askPromptSignal.digit} on {askPromptSignal.symbolLabel} (Score {askPromptSignal.score})
+                  Signal Ready: {askPromptSignal.contractType === 'DIGITMATCH' ? 'Matches' : 'Differs'} Digit{' '}
+                  {askPromptSignal.digit} on {askPromptSignal.symbolLabel} ({askPromptSignal.score}%)
                 </div>
                 <div className="mt-2 flex gap-2">
                   <button
@@ -1331,7 +1432,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
               </div>
             )}
 
-            {/* Live Bot Trades Ledger */}
+            {/* Session Trades Ledger */}
             {sessionTrades.length > 0 && (
               <div className="mt-3 space-y-1.5 border-t border-[#E5E9EF] pt-3 dark:border-[#243040]">
                 <div className="text-[11px] font-medium text-[#6B7280] dark:text-[#9CA3AF]">
@@ -1369,7 +1470,7 @@ export const AnalyserBotWorkspace: React.FC<AnalyserBotWorkspaceProps> = ({
                 </div>
               </div>
             )}
-          </div>
+          </section>
         </div>
       </div>
     </div>

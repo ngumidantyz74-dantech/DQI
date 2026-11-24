@@ -442,6 +442,7 @@ export const dqiApi = {
   authorizeDerivOAuthAccounts: (entries: Array<{ loginid: string; token: string; currency?: string }>) =>
     browserDerivPublic.authorizeOAuthAccounts(entries),
   switchDerivAccount: (loginid: string) => browserDerivPublic.switchAccount(loginid),
+  refreshDerivBalances: () => browserDerivPublic.refreshAllBalances(false),
   disconnectDeriv: () => browserDerivPublic.disconnectSession(),
   subscribeDerivContracts: (cb: (contracts: LiveDerivContract[]) => void) =>
     browserDerivPublic.subscribeContracts(cb),

@@ -583,21 +583,7 @@ class BrowserDerivClient {
     this.emitSession();
 
     // Subscribe to live balance updates across ALL linked Demo & Real accounts
-    try {
-      if (!this.balanceSubActive) {
-        this.balanceSubActive = true;
-        await this.request({ balance: 1, account: 'all', subscribe: 1 });
-      } else {
-        await this.request({ balance: 1, account: 'all' });
-      }
-    } catch {
-      // Fallback single-account balance subscription
-      try {
-        await this.request({ balance: 1, subscribe: 1 });
-      } catch {
-        // ignore non-fatal balance stream error
-      }
-    }
+    await this.refreshAllBalances(true);
 
     // Load any currently open contracts on this Deriv account
     try {
@@ -613,6 +599,23 @@ class BrowserDerivClient {
     }
 
     return this.getSessionState();
+  }
+
+  public async refreshAllBalances(subscribe = false): Promise<void> {
+    try {
+      if (subscribe && !this.balanceSubActive) {
+        this.balanceSubActive = true;
+        await this.request({ balance: 1, account: 'all', subscribe: 1 });
+      } else {
+        await this.request({ balance: 1, account: 'all' });
+      }
+    } catch {
+      try {
+        await this.request(subscribe ? { balance: 1, subscribe: 1 } : { balance: 1 });
+      } catch {
+        // ignore non-fatal balance stream error
+      }
+    }
   }
 
   public async switchAccount(loginid: string): Promise<DerivSessionState> {

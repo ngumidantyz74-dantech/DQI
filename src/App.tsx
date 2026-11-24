@@ -284,15 +284,38 @@ export default function App() {
     }
   };
 
-  // Pick primary Demo (VRTC) and primary Real (CR/MF/etc.) accounts for the top bar
-  const demoAccount = useMemo(
-    () => derivSession.accounts.find((a) => a.isVirtual) || null,
-    [derivSession.accounts]
-  );
-  const realAccount = useMemo(
-    () => derivSession.accounts.find((a) => !a.isVirtual) || null,
-    [derivSession.accounts]
-  );
+  // Periodically refresh all linked Demo + Real Deriv balances when connected
+  useEffect(() => {
+    if (!derivSession.connected) return;
+    void dqiApi.refreshDerivBalances();
+    const timer = window.setInterval(() => {
+      void dqiApi.refreshDerivBalances();
+    }, 20000);
+    return () => window.clearInterval(timer);
+  }, [derivSession.connected]);
+
+  // Pick primary Demo (VRTC) and primary Real (CR/MF) accounts for the top bar
+  const demoAccount = useMemo(() => {
+    const virtuals = derivSession.accounts.filter((a) => a.isVirtual);
+    return (
+      virtuals.find((a) => a.currency === 'USD' && a.balance !== null) ||
+      virtuals.find((a) => a.balance !== null) ||
+      virtuals[0] ||
+      null
+    );
+  }, [derivSession.accounts]);
+
+  const realAccount = useMemo(() => {
+    const reals = derivSession.accounts.filter((a) => !a.isVirtual);
+    return (
+      reals.find((a) => a.hasToken && a.currency === 'USD' && a.balance !== null) ||
+      reals.find((a) => a.currency === 'USD' && a.balance !== null) ||
+      reals.find((a) => a.balance !== null && a.balance > 0) ||
+      reals.find((a) => a.balance !== null) ||
+      reals[0] ||
+      null
+    );
+  }, [derivSession.accounts]);
 
   return (
     <div className="min-h-screen bg-[#F5F7FA] text-[#20242B] antialiased dark:bg-[#0D131A] dark:text-[#F3F4F6]">
@@ -358,7 +381,9 @@ export default function App() {
                   >
                     Demo{' '}
                     {demoAccount.balance !== null
-                      ? `$${demoAccount.balance.toFixed(2)}`
+                      ? demoAccount.currency === 'USD'
+                        ? `$${demoAccount.balance.toFixed(2)}`
+                        : `${demoAccount.balance.toFixed(2)} ${demoAccount.currency}`
                       : demoAccount.loginid}
                   </button>
                 )}
@@ -376,7 +401,9 @@ export default function App() {
                   >
                     Real{' '}
                     {realAccount.balance !== null
-                      ? `$${realAccount.balance.toFixed(2)}`
+                      ? realAccount.currency === 'USD'
+                        ? `$${realAccount.balance.toFixed(2)}`
+                        : `${realAccount.balance.toFixed(2)} ${realAccount.currency}`
                       : realAccount.loginid}
                   </button>
                 ) : (
