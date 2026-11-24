@@ -3,9 +3,31 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Ephemeral fallback keys for local/preview boots when env secrets are not yet provided.
-const EPHEMERAL_SESSION_KEY = crypto.randomBytes(32).toString('hex');
-const EPHEMERAL_ENC_KEY = crypto.randomBytes(32);
+export const DEFAULT_DERIV_PARTNER_APP_ID = '352P3WGh6Jm4clLrnbq6u';
+export const DEFAULT_DERIV_CALLBACK_URL = 'https://dqideriv.pipflowtrade.site/api/v1/auth/deriv/callback';
+
+// Deterministic fallback key material when DQI_ENCRYPTION_KEY_BASE64 / DQI_SESSION_SECRET are not set in Vercel env.
+// Keeps PKCE cookies decryptable across separate Vercel serverless Lambda cold starts.
+function deriveFallbackKeyMaterial(): Buffer {
+  const seed = [
+    process.env.DQI_SESSION_SECRET,
+    process.env.QUANT_SESSION_SECRET,
+    process.env.DATABASE_URL,
+    process.env.POSTGRES_URL,
+    process.env.CRON_SECRET,
+    process.env.VERCEL_PROJECT_ID,
+    DEFAULT_DERIV_PARTNER_APP_ID,
+    DEFAULT_DERIV_CALLBACK_URL,
+    'dqi-stateless-v1',
+  ]
+    .filter(Boolean)
+    .join('|');
+  return crypto.createHash('sha256').update(seed).digest();
+}
+
+const FALLBACK_KEY_BYTES = deriveFallbackKeyMaterial();
+const EPHEMERAL_SESSION_KEY = FALLBACK_KEY_BYTES.toString('hex');
+const EPHEMERAL_ENC_KEY = FALLBACK_KEY_BYTES;
 
 function parsePositiveNumber(raw: string | undefined, fallback: number): number {
   const num = Number(raw);
@@ -21,9 +43,6 @@ function cleanEnv(raw: string | undefined): string {
   return (raw ?? '').trim().replace(/^["']|["']$/g, '');
 }
 
-export const DEFAULT_DERIV_PARTNER_APP_ID = '352P3WGh6Jm4clLrnbq6u';
-export const DEFAULT_DERIV_CALLBACK_URL = 'https://dqideriv.pipflowtrade.site/api/v1/auth/deriv/callback';
-
 function resolveDerivClientId(): string {
   const candidates = [
     cleanEnv(process.env.DERIV_CLIENT_ID),
@@ -38,7 +57,14 @@ function resolveDerivClientId(): string {
 
 function resolveDerivRedirectUri(): string {
   const raw = cleanEnv(process.env.DERIV_REDIRECT_URI);
-  if (!raw || raw.startsWith('http://localhost')) {
+  const clientId = resolveDerivClientId();
+  if (
+    !raw ||
+    raw.startsWith('http://localhost') ||
+    raw.startsWith('http://127.0.0.1') ||
+    (clientId === DEFAULT_DERIV_PARTNER_APP_ID &&
+      (raw.includes('.vercel.app') || !raw.startsWith('https://dqideriv.pipflowtrade.site/')))
+  ) {
     return DEFAULT_DERIV_CALLBACK_URL;
   }
   return raw;

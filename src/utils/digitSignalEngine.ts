@@ -12,12 +12,22 @@ export interface LiveProposalQuote {
   payout: number;
 }
 
+export interface DigitDistributionStats {
+  sampleCount: number;
+  chiSquare: number;
+  regimeLabel: 'RANDOM_UNIFORM' | 'SKEWED_SAMPLE';
+  maxDeviationPct: number;
+}
+
 export interface RankedSignal {
   symbol: string;
   symbolLabel: string;
   contractType: 'DIGITMATCH' | 'DIGITDIFF';
   digit: number;
+  /** Sample activity / filter fit index (0–100), NOT future win probability */
   score: number;
+  /** True theoretical single-tick probability on fair 0-9 ticks: 90% Differ / 10% Match */
+  trueWinProbPct: number;
   strength: 'STRONG' | 'MODERATE' | 'WAIT';
   gateStatus: GateStatus;
   entryReady: boolean;
@@ -30,6 +40,7 @@ export interface RankedSignal {
   avoidPct: number;
   breakEvenPct: number;
   edgePct: number;
+  chiSquare: number;
   lastSeenTicksAgo: number | null;
   payout: number | null;
   askPrice: number | null;
@@ -43,6 +54,7 @@ export interface WalkForwardTickReplay {
   signalsTriggered: number;
   wins: number;
   losses: number;
+  maxLossStreak: number;
   winRatePct: number;
   netPnlPerDollar: number;
   contractType: 'DIGITMATCH' | 'DIGITDIFF';
@@ -67,21 +79,44 @@ export function mergeUniqueTicks(
   return merged.slice(-maxTicks);
 }
 
+export function evaluateDigitDistributionStats(ticks: SimpleTick[]): DigitDistributionStats {
+  const slice = ticks.slice(-500);
+  const n = slice.length;
+  if (n < 20) {
+    return {
+      sampleCount: n,
+      chiSquare: 0,
+      regimeLabel: 'RANDOM_UNIFORM',
+      maxDeviationPct: 0,
+    };
+  }
+  const counts = new Array<number>(10).fill(0);
+  for (const t of slice) {
+    if (t.digit >= 0 && t.digit <= 9) counts[t.digit] += 1;
+  }
+  const expected = n / 10;
+  let chiSq = 0;
+  let maxDev = 0;
+  for (let d = 0; d < 10; d += 1) {
+    chiSq += Math.pow(counts[d] - expected, 2) / expected;
+    const dev = Math.abs((counts[d] / n) * 100 - 10);
+    if (dev > maxDev) maxDev = dev;
+  }
+  // df = 9, p=0.05 critical value is 16.92
+  return {
+    sampleCount: n,
+    chiSquare: Number(chiSq.toFixed(2)),
+    regimeLabel: chiSq >= 16.92 ? 'SKEWED_SAMPLE' : 'RANDOM_UNIFORM',
+    maxDeviationPct: Number(maxDev.toFixed(1)),
+  };
+}
+
 function zScoreForDigit(count: number, total: number): number {
   if (total <= 0) return 0;
   const expected = total * 0.1;
   const sd = Math.sqrt(total * 0.1 * 0.9);
   if (sd <= 0) return 0;
   return (count - expected) / sd;
-}
-
-function wilsonLowerPct(k: number, n: number, z = 1.645): number {
-  if (n <= 0) return 0;
-  const p = k / n;
-  const denom = 1 + (z * z) / n;
-  const center = (p + (z * z) / (2 * n)) / denom;
-  const margin = (z * Math.sqrt((p * (1 - p) + (z * z) / (4 * n)) / n)) / denom;
-  return Math.max(0, center - margin) * 100;
 }
 
 export function evaluateLiveDigitSignals(params: {
@@ -107,6 +142,7 @@ export function evaluateLiveDigitSignals(params: {
   const microN = microSlice.length;
 
   const latestDigit = ticks[n - 1].digit;
+  const distStats = evaluateDigitDistributionStats(longSlice);
 
   const longCounts = new Array<number>(10).fill(0);
   const medCounts = new Array<number>(10).fill(0);
@@ -134,11 +170,11 @@ export function evaluateLiveDigitSignals(params: {
     microCounts[microSlice[i].digit] += 1;
   }
 
-  // Real Deriv break-even probabilities (or accurate fallback until proposal arrives)
+  // Real Deriv break-even probabilities (with realistic Deriv defaults before proposal arrives)
   const matchBePct =
     matchProposal && matchProposal.payout > 0
       ? (matchProposal.askPrice / matchProposal.payout) * 100
-      : 11.3;
+      : 11.9;
   const differBePct =
     differProposal && differProposal.payout > 0
       ? (differProposal.askPrice / differProposal.payout) * 100
@@ -159,20 +195,18 @@ export function evaluateLiveDigitSignals(params: {
     const transPct =
       latestFromTotal > 0 ? (transAfterLatest[digit] / latestFromTotal) * 100 : 10;
 
-    // 1. DIGITDIFF (DiffersScalper Engine)
+    // 1. DIGITDIFF (Cold-Digit Differ Engine — 90% True Per-Tick Hit Rate)
     if (filter === 'BEST' || filter === 'DIGITDIFF') {
       const differRate100 = 100 - pctMed;
       const differRateLong = 100 - pctLong;
       const blendedDifferRate = differRate100 * 0.65 + differRateLong * 0.35;
-      const edgePct = blendedDifferRate - differBePct;
-      const compCiLow = wilsonLowerPct(medN - medCounts[digit], medN);
+      const sampleVsBe = blendedDifferRate - differBePct;
 
       const checkSample = n >= 100;
-      const checkMedCold = pctMed <= 6.5;
+      const checkMedCold = pctMed <= 7.0;
       const checkLongSafe = pctLong <= 10.2;
       const checkMicroQuiet = microCnt <= 1 && digit !== latestDigit;
-      const checkMarkovLow = latestFromTotal < 8 || transPct <= 9.5;
-      const checkEdge = edgePct >= 1.5;
+      const checkMarkovLow = latestFromTotal < 8 || transPct <= 10.0;
       const checkVol = !extremeVol;
 
       const checks = [
@@ -200,9 +234,9 @@ export function evaluateLiveDigitSignals(params: {
               : 'Low sample',
         },
         {
-          label: 'Beats Break-Even',
-          passed: checkEdge && checkVol,
-          detail: `${blendedDifferRate.toFixed(1)}% vs ${differBePct.toFixed(1)}% BE`,
+          label: 'Sample vs Payout BE',
+          passed: sampleVsBe >= 1.0 && checkVol,
+          detail: `${blendedDifferRate.toFixed(1)}% sample vs ${differBePct.toFixed(1)}% BE`,
         },
       ];
 
@@ -213,24 +247,22 @@ export function evaluateLiveDigitSignals(params: {
         checkLongSafe &&
         checkMicroQuiet &&
         checkMarkovLow &&
-        checkEdge &&
+        sampleVsBe >= 1.0 &&
         checkVol;
 
-      const rawScore =
-        50 +
-        Math.max(-12, (10 - pctMed) * 3.8) +
-        Math.max(-6, (10 - pctLong) * 2.2) +
-        (microCnt === 0 ? 7 : microCnt === 1 ? 2 : -10) +
-        (digit === latestDigit ? -12 : 3) +
-        Math.max(-8, (10 - transPct) * 0.9) +
-        (compCiLow >= differBePct - 1.5 ? 4 : 0) -
+      const rawActivity =
+        55 +
+        Math.max(-14, (10 - pctMed) * 3.6) +
+        Math.max(-8, (10 - pctLong) * 2.2) +
+        (microCnt === 0 ? 8 : microCnt === 1 ? 2 : -10) +
+        (digit === latestDigit ? -14 : 3) +
+        Math.max(-8, (10 - transPct) * 0.8) -
         highVolPenalty;
 
-      const clampedScore = Math.max(15, Math.min(96, Math.round(rawScore)));
-      const finalScore = entryReady ? Math.max(80, clampedScore) : Math.min(76, clampedScore);
+      const clamped = Math.max(20, Math.min(95, Math.round(rawActivity)));
       const gateStatus: GateStatus = entryReady
         ? 'ENTRY_READY'
-        : passedCount >= 4 && finalScore >= 68
+        : passedCount >= 4 && clamped >= 65
         ? 'WATCH'
         : 'WAIT_NO_EDGE';
 
@@ -239,7 +271,8 @@ export function evaluateLiveDigitSignals(params: {
         symbolLabel,
         contractType: 'DIGITDIFF',
         digit,
-        score: finalScore,
+        score: clamped,
+        trueWinProbPct: 90.0,
         strength: entryReady ? 'STRONG' : gateStatus === 'WATCH' ? 'MODERATE' : 'WAIT',
         gateStatus,
         entryReady,
@@ -251,44 +284,45 @@ export function evaluateLiveDigitSignals(params: {
         transitionSamples: latestFromTotal,
         avoidPct: Number(differRate100.toFixed(1)),
         breakEvenPct: Number(differBePct.toFixed(1)),
-        edgePct: Number(edgePct.toFixed(1)),
+        edgePct: Number(sampleVsBe.toFixed(1)),
+        chiSquare: distStats.chiSquare,
         lastSeenTicksAgo: gap,
         payout: differProposal?.payout ?? null,
         askPrice: differProposal?.askPrice ?? null,
         sampleCount: n,
         checks,
         reason: entryReady
-          ? `Differ ${digit}: ${differRate100.toFixed(1)}% avoid in 100t (${pctLong.toFixed(1)}% in ${longN}t), ${microCnt} hit(s) in 25t, ${transPct.toFixed(0)}% after ${latestDigit}`
-          : `WAIT on Differ ${digit}: ${passedCount}/5 checks passed (${pctMed.toFixed(1)}% 100t · ${microCnt}/25 micro · edge ${edgePct >= 0 ? '+' : ''}${edgePct.toFixed(1)}%)`,
+          ? `Coldest Differ ${digit}: ${differRate100.toFixed(1)}% sample avoid (${microCnt}/25 micro). True win rate is 90% per tick — use burst cap & stop on 1st loss.`
+          : `Standby Differ ${digit}: ${passedCount}/5 sample filters met (${pctMed.toFixed(1)}% 100t · ${microCnt}/25 micro).`,
       });
     }
 
-    // 2. DIGITMATCH (MatchesScalper Engine)
+    // 2. DIGITMATCH (Hot-Cluster Scanner — Honest 10% Single-Tick Base Odds)
     if (filter === 'BEST' || filter === 'DIGITMATCH') {
       const blendedMatchRate = pctMed * 0.65 + pctLong * 0.35;
-      const edgePct = blendedMatchRate - matchBePct;
+      const sampleVsBe = blendedMatchRate - matchBePct;
 
       const checkSample = n >= 100;
-      const checkMedHot = pctMed >= 14.0 && zMed >= 1.1;
-      const checkLongBias = pctLong >= 11.2 && zLong >= 0.85;
+      const checkMedHot = pctMed >= 15.0 && zMed >= 1.45;
+      const checkLongBias = pctLong >= 11.4 && zLong >= 0.95;
       const checkLiveTrigger =
-        microCnt >= 3 || (latestFromTotal >= 8 && transPct >= 16.0);
-      const checkCadence = gap >= 1 && gap <= 9;
-      const checkEdge = edgePct >= 1.5 && !extremeVol;
+        microCnt >= 3 || (latestFromTotal >= 8 && transPct >= 18.0);
+      const checkCadence = gap >= 1 && gap <= 8;
+      const checkBeatsBe = sampleVsBe >= 2.0 && !extremeVol;
 
       const checks = [
         {
-          label: '100t Hot Digit',
+          label: '100t Hot Cluster',
           passed: checkMedHot,
           detail: `${pctMed.toFixed(1)}% hit (z=${zMed.toFixed(2)})`,
         },
         {
-          label: `${longN}t Trend`,
+          label: `${longN}t Sample Skew`,
           passed: checkLongBias,
           detail: `${pctLong.toFixed(1)}% (z=${zLong.toFixed(2)})`,
         },
         {
-          label: `Trigger / Markov (${latestDigit}→${digit})`,
+          label: `Markov / Burst (${latestDigit}→${digit})`,
           passed: checkLiveTrigger,
           detail: `${microCnt}/25 hits · ${transPct.toFixed(1)}% after ${latestDigit}`,
         },
@@ -298,9 +332,9 @@ export function evaluateLiveDigitSignals(params: {
           detail: `Last seen ${gap} tick(s) ago`,
         },
         {
-          label: 'Beats Break-Even',
-          passed: checkEdge,
-          detail: `${blendedMatchRate.toFixed(1)}% vs ${matchBePct.toFixed(1)}% BE`,
+          label: 'Sample vs Payout BE',
+          passed: checkBeatsBe,
+          detail: `${blendedMatchRate.toFixed(1)}% sample vs ${matchBePct.toFixed(1)}% BE`,
         },
       ];
 
@@ -311,22 +345,22 @@ export function evaluateLiveDigitSignals(params: {
         checkLongBias &&
         checkLiveTrigger &&
         checkCadence &&
-        checkEdge;
+        checkBeatsBe;
 
-      const rawScore =
-        44 +
-        Math.max(-10, (pctMed - 10) * 3.4) +
-        Math.max(-6, (pctLong - 10) * 3.0) +
-        Math.min(14, microCnt * 3.2) +
-        (latestFromTotal >= 6 ? Math.max(-4, (transPct - 10) * 0.9) : 0) +
-        (checkCadence ? 6 : -6) -
+      const rawActivity =
+        38 +
+        Math.max(-10, (pctMed - 10) * 3.0) +
+        Math.max(-6, (pctLong - 10) * 2.5) +
+        Math.min(12, microCnt * 2.8) +
+        (latestFromTotal >= 6 ? Math.max(-4, (transPct - 10) * 0.7) : 0) +
+        (checkCadence ? 5 : -5) -
         highVolPenalty;
 
-      const clampedScore = Math.max(15, Math.min(95, Math.round(rawScore)));
-      const finalScore = entryReady ? Math.max(80, clampedScore) : Math.min(75, clampedScore);
+      // Never inflate Match score into misleading 85%+ confidence numbers
+      const clamped = Math.max(12, Math.min(78, Math.round(rawActivity)));
       const gateStatus: GateStatus = entryReady
         ? 'ENTRY_READY'
-        : passedCount >= 3 && finalScore >= 66
+        : passedCount >= 3 && clamped >= 56
         ? 'WATCH'
         : 'WAIT_NO_EDGE';
 
@@ -335,7 +369,8 @@ export function evaluateLiveDigitSignals(params: {
         symbolLabel,
         contractType: 'DIGITMATCH',
         digit,
-        score: finalScore,
+        score: clamped,
+        trueWinProbPct: 10.0,
         strength: entryReady ? 'STRONG' : gateStatus === 'WATCH' ? 'MODERATE' : 'WAIT',
         gateStatus,
         entryReady,
@@ -347,22 +382,26 @@ export function evaluateLiveDigitSignals(params: {
         transitionSamples: latestFromTotal,
         avoidPct: Number((100 - pctMed).toFixed(1)),
         breakEvenPct: Number(matchBePct.toFixed(1)),
-        edgePct: Number(edgePct.toFixed(1)),
+        edgePct: Number(sampleVsBe.toFixed(1)),
+        chiSquare: distStats.chiSquare,
         lastSeenTicksAgo: gap,
         payout: matchProposal?.payout ?? null,
         askPrice: matchProposal?.askPrice ?? null,
         sampleCount: n,
         checks,
         reason: entryReady
-          ? `Match ${digit}: ${pctMed.toFixed(1)}% in 100t (${pctLong.toFixed(1)}% in ${longN}t, z=${zLong.toFixed(2)}), ${transPct.toFixed(0)}% after ${latestDigit}`
-          : `WAIT on Match ${digit}: ${passedCount}/5 checks passed (${pctMed.toFixed(1)}% 100t · ${pctLong.toFixed(1)}% ${longN}t · ${microCnt}/25 micro)`,
+          ? `Hot Cluster Match ${digit}: ${pctMed.toFixed(1)}% in 100t (${microCnt}/25 micro). Warning: True hit odds are ~10% per tick (expect losing streaks; cap max misses at 3).`
+          : `Standby Match ${digit}: ${passedCount}/5 cluster checks met (${pctMed.toFixed(1)}% 100t · ${pctLong.toFixed(1)}% ${longN}t · true odds 10%).`,
       });
     }
   }
 
-  // Always rank ENTRY_READY first, then highest score
+  // Rank ENTRY_READY first, then prioritize safer 90% Differ setups in BEST mode, then activity score
   results.sort((a, b) => {
     if (a.entryReady !== b.entryReady) return a.entryReady ? -1 : 1;
+    if (filter === 'BEST' && a.trueWinProbPct !== b.trueWinProbPct) {
+      return b.trueWinProbPct - a.trueWinProbPct;
+    }
     return b.score - a.score;
   });
 
@@ -371,7 +410,7 @@ export function evaluateLiveDigitSignals(params: {
 
 /**
  * Zero-lookahead replay over the most recent real Deriv ticks:
- * Tests whether ENTRY_READY gated signals produced real net wins using live Deriv payout ratios.
+ * Reports honest wins, losses, worst consecutive loss streak, and net P&L per $1 stake.
  */
 export function runWalkForwardDigitReplay(params: {
   symbol: string;
@@ -396,7 +435,7 @@ export function runWalkForwardDigitReplay(params: {
     contractType === 'DIGITMATCH'
       ? matchProposal && matchProposal.askPrice > 0
         ? matchProposal.payout / matchProposal.askPrice
-        : 8.85
+        : 8.4
       : differProposal && differProposal.askPrice > 0
       ? differProposal.payout / differProposal.askPrice
       : 1.095;
@@ -409,6 +448,7 @@ export function runWalkForwardDigitReplay(params: {
       signalsTriggered: 0,
       wins: 0,
       losses: 0,
+      maxLossStreak: 0,
       winRatePct: 0,
       netPnlPerDollar: 0,
       contractType,
@@ -418,9 +458,10 @@ export function runWalkForwardDigitReplay(params: {
   let signalsTriggered = 0;
   let wins = 0;
   let losses = 0;
+  let curLossStreak = 0;
+  let maxLossStreak = 0;
   let netPnl = 0;
 
-  // Step every 2 ticks so evaluation stays sub-millisecond on every tick
   for (let i = startIdx; i < ticks.length - 1; i += 2) {
     const prefix = ticks.slice(Math.max(0, i - 350), i);
     const ranked = evaluateLiveDigitSignals({
@@ -443,9 +484,12 @@ export function runWalkForwardDigitReplay(params: {
         : actualNextDigit !== top.digit;
     if (isWin) {
       wins += 1;
+      curLossStreak = 0;
       netPnl += netWinPerDollar;
     } else {
       losses += 1;
+      curLossStreak += 1;
+      if (curLossStreak > maxLossStreak) maxLossStreak = curLossStreak;
       netPnl -= 1;
     }
   }
@@ -455,6 +499,7 @@ export function runWalkForwardDigitReplay(params: {
     signalsTriggered,
     wins,
     losses,
+    maxLossStreak,
     winRatePct: signalsTriggered > 0 ? Number(((wins / signalsTriggered) * 100).toFixed(1)) : 0,
     netPnlPerDollar: Number(netPnl.toFixed(2)),
     contractType,

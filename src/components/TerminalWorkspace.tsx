@@ -546,7 +546,7 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
             label="Signal"
             value={quant ? quant.direction : '—'}
             tone={quant?.direction === 'BUY' ? 'buy' : quant?.direction === 'SELL' ? 'sell' : 'neutral'}
-            sub={quant ? `${(quant.calibrated_confidence * 100).toFixed(0)}% raw score` : 'Run chart'}
+            sub={quant ? `${(quant.calibrated_confidence * 100).toFixed(0)}% tech align (not win %)` : 'Run chart'}
           />
           <StatTile label="Regime" value={quant ? quant.regime.replaceAll('_', ' ') : '—'} sub={`TF ${timeframe}`} />
           <StatTile
@@ -630,7 +630,23 @@ export const TerminalWorkspace: React.FC<TerminalWorkspaceProps> = ({
 
           <div className="space-y-3">
             <div>
-              <label className="block text-xs font-medium text-[#6B7280] mb-1">Contract Type</label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-xs font-medium text-[#6B7280]">Contract Type</label>
+                {quant &&
+                  ((quant.direction === 'SELL' && contractType === 'CALL') ||
+                    (quant.direction === 'BUY' && contractType === 'PUT')) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setContractType(quant.direction === 'SELL' ? 'PUT' : 'CALL');
+                        setProposal(null);
+                      }}
+                      className="text-[11px] font-semibold text-[#0866FF] hover:underline"
+                    >
+                      Sync to {quant.direction === 'SELL' ? 'Fall (PUT)' : 'Rise (CALL)'}
+                    </button>
+                  )}
+              </div>
               <select
                 value={contractType}
                 onChange={(e) => {

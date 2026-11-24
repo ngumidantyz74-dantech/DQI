@@ -1290,11 +1290,15 @@ export function registerApiRoutes(app: Express): void {
       throw new Error(`Deriv accounts request failed (HTTP ${resp.status}): ${errText.slice(0, 180)}`);
     }
     const payload = (await resp.json()) as {
-      data?: Array<Record<string, unknown>>;
+      data?: Array<Record<string, unknown>> | { accounts?: Array<Record<string, unknown>> };
       accounts?: Array<Record<string, unknown>>;
     };
-    const rows = Array.isArray(payload.data)
+    const rows = Array.isArray(payload)
+      ? (payload as Array<Record<string, unknown>>)
+      : Array.isArray(payload.data)
       ? payload.data
+      : payload.data && typeof payload.data === 'object' && Array.isArray(payload.data.accounts)
+      ? payload.data.accounts
       : Array.isArray(payload.accounts)
       ? payload.accounts
       : [];
@@ -1470,7 +1474,7 @@ export function registerApiRoutes(app: Express): void {
       return;
     }
 
-    const state = randomToken(24);
+    const nonce = randomToken(16);
     const verifier = randomToken(32);
     const challenge = pkceChallenge(verifier);
     const encVerifier = encryptSecret(verifier);
@@ -1480,13 +1484,18 @@ export function registerApiRoutes(app: Express): void {
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const returnOrigin = host ? `${proto}://${Array.isArray(host) ? host[0] : host}` : serverConfig.appUrl;
 
+    // Authenticated-encrypted stateless PKCE state so callback works across Vercel Lambdas & mobile browsers
+    const state = encryptSecret(
+      JSON.stringify({ n: nonce, v: verifier, r: redirectUri, c: clientId, e: expiresAt })
+    );
+
     previewStore.oauthTransactions.set(sha256(state), {
       verifier: encVerifier,
       redirectUri,
       expiresAt,
     });
 
-    // Also persist encrypted PKCE transaction in HttpOnly cookie so Vercel serverless callbacks validate reliably
+    // Also persist encrypted PKCE transaction in HttpOnly cookie
     const txCookie = encryptSecret(
       JSON.stringify({ state, verifier, redirectUri, clientId, returnOrigin, expiresAt })
     );
@@ -1534,7 +1543,7 @@ export function registerApiRoutes(app: Express): void {
       return;
     }
 
-    // Resolve PKCE transaction from memory store OR encrypted serverless cookie
+    // Resolve PKCE transaction from memory store, encrypted cookie, OR authenticated-encrypted state
     let verifier: string | null = null;
     let redirectUri = serverConfig.derivRedirectUri;
     let clientId = serverConfig.derivClientId;
@@ -1564,6 +1573,24 @@ export function registerApiRoutes(app: Express): void {
           verifier = cookieTx.verifier;
           if (cookieTx.redirectUri) redirectUri = cookieTx.redirectUri;
           if (cookieTx.clientId) clientId = cookieTx.clientId;
+        }
+      } catch {
+        verifier = null;
+      }
+    }
+
+    if (!verifier) {
+      try {
+        const stateTx = JSON.parse(decryptSecret(state)) as {
+          v?: string;
+          r?: string;
+          c?: string;
+          e?: number;
+        };
+        if (stateTx.v && (stateTx.e ?? 0) > Date.now()) {
+          verifier = stateTx.v;
+          if (stateTx.r) redirectUri = stateTx.r;
+          if (stateTx.c) clientId = stateTx.c;
         }
       } catch {
         verifier = null;

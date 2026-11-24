@@ -148,6 +148,10 @@ export default function App() {
         setGlobalNotice(
           `Connected via Deriv App ${restored.appId}. Active: ${restored.activeIsVirtual ? 'DEMO' : 'REAL'} (${restored.activeLoginId}).`
         );
+      } else if (oauthState === 'connected' && !restored?.connected) {
+        setGlobalNotice(
+          'Returned from Deriv OAuth, but account details could not be loaded (check third-party cookie settings or connect with your Deriv API token).'
+        );
       }
     })();
   }, []);
